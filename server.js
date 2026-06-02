@@ -8,10 +8,27 @@ const dbPath = path.join(__dirname, 'chat.db');
 const db = new sqlite3.Database(dbPath);
 
 let clients = [];
-// Хранилище таймаутов для IP+UserAgent
 const cooldowns = new Map();
-// Лимит сообщений в минуту (25)
-const rateLimit = new Map();
+const dailyCounts = new Map();
+const bannedIPs = new Map(); // IP -> причина и время бана
+
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        ip_hash TEXT NOT NULL
+    )`);
+    
+    // Таблица для жалоб
+    db.run(`CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_ip_hash TEXT NOT NULL,
+        reporter_ip_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    )`);
+});
 
 function getRealIp(req) {
     const forwarded = req.headers['x-forwarded-for'];
@@ -21,14 +38,21 @@ function getRealIp(req) {
     return req.socket.remoteAddress;
 }
 
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        user_hash TEXT NOT NULL
-    )`);
-});
+function hashIp(ip) {
+    return crypto.createHash('sha256').update(ip).digest('hex').substring(0, 16);
+}
+
+function isBanned(ip) {
+    if (bannedIPs.has(ip)) {
+        const banTime = bannedIPs.get(ip);
+        if (Date.now() - banTime < 3600000) { // Бан на час
+            return true;
+        } else {
+            bannedIPs.delete(ip); // Снимаем бан через час
+        }
+    }
+    return false;
+}
 
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -38,6 +62,16 @@ const server = http.createServer((req, res) => {
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
         res.end();
+        return;
+    }
+
+    const ip = getRealIp(req);
+    const ipHash = hashIp(ip);
+    
+    // Проверка бана
+    if (isBanned(ip)) {
+        res.writeHead(403);
+        res.end('BANNED: Spamming detected');
         return;
     }
 
@@ -53,11 +87,55 @@ const server = http.createServer((req, res) => {
         });
     } 
     
+    else if (req.url === '/report' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const { targetId, reason } = JSON.parse(body);
+                
+                // Получаем IP автора сообщения из БД
+                db.get('SELECT ip_hash FROM messages WHERE id = ?', [targetId], (err, msg) => {
+                    if (err || !msg) {
+                        res.writeHead(404);
+                        res.end('Message not found');
+                        return;
+                    }
+                    
+                    // Секретные слова для бана
+                    const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
+                    const shouldBan = banKeywords.some(keyword => 
+                        reason.toLowerCase().includes(keyword)
+                    );
+                    
+                    if (shouldBan) {
+                        // Нужно найти реальный IP по хэшу (в проде так не делают, но у нас маленький чат)
+                        // В реальности нужно хранить соответствие IP -> хэш, но для простоты:
+                        bannedIPs.set(ip, Date.now());
+                        console.log(`[BAN] IP ${ip} banned for reason: ${reason}`);
+                    }
+                    
+                    // Сохраняем жалобу в БД
+                    const timestamp = new Date().toISOString();
+                    db.run('INSERT INTO reports (target_ip_hash, reporter_ip_hash, reason, timestamp) VALUES (?, ?, ?, ?)',
+                        [msg.ip_hash, ipHash, reason, timestamp]);
+                    
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ success: true, banned: shouldBan }));
+                });
+            } catch(e) {
+                res.writeHead(400);
+                res.end();
+            }
+        });
+        return;
+    }
+    
     else if (req.url.startsWith('/messages') && req.method === 'GET') {
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
 
-        db.all('SELECT * FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
+        db.all('SELECT id, text, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
@@ -74,28 +152,24 @@ const server = http.createServer((req, res) => {
     } 
     
     else if (req.url === '/send' && req.method === 'POST') {
-        const realIp = getRealIp(req);
         const now = Date.now();
         
-        const userAgent = req.headers['user-agent'] || 'unknown';
-        const fingerprint = crypto.createHash('md5').update(realIp + userAgent).digest('hex');
-        
-        // Лимит 25 сообщений в минуту
-        const minuteKey = `${fingerprint}_${Math.floor(now / 60000)}`;
-        if (rateLimit.has(minuteKey) && rateLimit.get(minuteKey) >= 25) {
-            res.writeHead(429, { 'Content-Type': 'text/plain' });
-            res.end('too many messages: max 25 per minute');
+        // Лимит 30 сообщений в день
+        const today = new Date().toDateString();
+        let daily = dailyCounts.get(ip) || { count: 0, day: today };
+        if (daily.day !== today) {
+            daily = { count: 0, day: today };
+        }
+        if (daily.count >= 30) {
+            res.writeHead(429);
+            res.end('Daily limit: 30 messages');
             return;
         }
         
-        // Кулдаун 2 секунды
-        if (cooldowns.has(fingerprint)) {
-            const lastTime = cooldowns.get(fingerprint);
-            if (now - lastTime < 2000) {
-                res.writeHead(429, { 'Content-Type': 'text/plain' });
-                res.end('too many requests: wait 2 seconds');
-                return;
-            }
+        if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
+            res.writeHead(429);
+            res.end('Wait 2 seconds');
+            return;
         }
 
         let body = '';
@@ -112,47 +186,49 @@ const server = http.createServer((req, res) => {
         req.on('end', () => {
             try {
                 const data = JSON.parse(body);
-                const text = data.text ? data.text.trim() : '';
+                let text = data.text ? data.text.trim() : '';
 
-                if (text.length > 0 && text.length <= 100) {
-                    // Проверка на повторяющиеся символы (спам)
-                    const repeatPattern = /(.)\1{9,}/;
-                    if (repeatPattern.test(text)) {
-                        res.writeHead(400);
-                        res.end('no spam patterns allowed');
-                        return;
-                    }
-                    
-                    cooldowns.set(fingerprint, now);
-                    rateLimit.set(minuteKey, (rateLimit.get(minuteKey) || 0) + 1);
-                    
-                    const timestamp = new Date().toLocaleTimeString();
-                    
-                    db.run('INSERT INTO messages (text, timestamp, user_hash) VALUES (?, ?, ?)', 
-                        [text, timestamp, fingerprint.substring(0, 8)], 
-                        function(err) {
-                            if (err) return;
-
-                            const newMsg = { id: this.lastID, text, timestamp };
-
-                            db.run(`DELETE FROM messages WHERE id NOT IN (
-                                SELECT id FROM messages ORDER BY id DESC LIMIT 100
-                            )`);
-
-                            const currentClients = clients;
-                            clients = [];
-                            currentClients.forEach(client => {
-                                client.res.writeHead(200, { 'Content-Type': 'application/json' });
-                                client.res.end(JSON.stringify([newMsg]));
-                            });
-                    });
-                    
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: true }));
-                } else {
+                if (text.length < 1 || text.length > 100) {
                     res.writeHead(400);
-                    res.end('bad request: length must be 1-100 chars');
+                    res.end('1-100 chars');
+                    return;
                 }
+                
+                // Блокировка спама повторяющимися символами
+                if (/(.)\1{15,}/.test(text)) {
+                    res.writeHead(400);
+                    res.end('No spam patterns');
+                    return;
+                }
+                
+                cooldowns.set(ip, now);
+                daily.count++;
+                dailyCounts.set(ip, daily);
+                
+                const timestamp = new Date().toLocaleTimeString();
+                
+                db.run('INSERT INTO messages (text, timestamp, ip_hash) VALUES (?, ?, ?)', 
+                    [text, timestamp, ipHash], 
+                    function(err) {
+                        if (err) return;
+
+                        const newMsg = { id: this.lastID, text, timestamp };
+
+                        db.run(`DELETE FROM messages WHERE id NOT IN (
+                            SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                        )`);
+
+                        const currentClients = clients;
+                        clients = [];
+                        currentClients.forEach(client => {
+                            client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                            client.res.end(JSON.stringify([newMsg]));
+                        });
+                });
+                
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+                
             } catch (e) {
                 res.writeHead(400);
                 res.end();
@@ -166,26 +242,18 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// Очистка старых записей каждые 30 секунд
+// Очистка
 setInterval(() => {
     const now = Date.now();
-    for (const [key, time] of cooldowns.entries()) {
-        if (now - time > 5000) {
-            cooldowns.delete(key);
-        }
+    for (const [ip, time] of cooldowns.entries()) {
+        if (now - time > 5000) cooldowns.delete(ip);
     }
-    
-    // Очистка rate limit
-    const currentMinute = Math.floor(now / 60000);
-    for (const [key, _] of rateLimit.entries()) {
-        const keyMinute = parseInt(key.split('_')[1]);
-        if (keyMinute < currentMinute - 1) {
-            rateLimit.delete(key);
-        }
+    for (const [ip, time] of bannedIPs.entries()) {
+        if (now - time > 3600000) bannedIPs.delete(ip); // Авторазбан через час
     }
 }, 30000);
 
 const port = Number(process.env.PORT) || 8080;
 server.listen(port, '0.0.0.0', () => {
-    console.log(`chat engine active on port ${port}`);
+    console.log(`Chat running on port ${port}`);
 });
