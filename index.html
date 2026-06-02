@@ -5,274 +5,360 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>global chat</title>
     <style>
-        html, body { 
-            margin: 0; 
-            padding: 0; 
-            width: 100%; 
-            height: 100%; 
-            overflow: hidden; 
-            background: #ffffff; 
-            font-family: sans-serif; 
-            color: #000000;
-            -webkit-text-size-adjust: 100%;
-        }
-        
-        .app-container {
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #ffffff;
+            height: 100vh;
             display: flex;
             flex-direction: column;
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 0;
-            left: 0;
         }
         
         .chat-area { 
             flex: 1; 
-            overflow-y: scroll; 
-            -webkit-overflow-scrolling: touch; 
+            overflow-y: auto; 
             padding: 20px; 
-            box-sizing: border-box; 
             display: flex; 
             flex-direction: column; 
             gap: 15px; 
         }
         
-        .message { display: flex; gap: 12px; align-items: flex-start; }
-        .avatar { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; background: #eee; flex-shrink: 0; }
-        .msg-body { display: flex; flex-direction: column; gap: 2px; }
-        .msg-header { font-size: 13px; font-weight: bold; color: #000000; }
-        .msg-time { font-size: 11px; color: #666666; font-weight: normal; margin-left: 8px; }
-        .msg-text { font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #000000; }
-        
-        .input-panel { 
-            padding: 15px 20px; 
-            background: #ffffff; 
-            border-top: 1px solid #e0e0e0; 
+        .message { 
             display: flex; 
-            gap: 10px; 
-            box-sizing: border-box; 
-            width: 100%;
+            gap: 12px; 
+            align-items: flex-start;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .avatar { 
+            width: 40px; 
+            height: 40px; 
+            border-radius: 50%; 
+            background: #f0f0f0;
+            cursor: pointer;
+            transition: transform 0.2s;
             flex-shrink: 0;
         }
         
-        .input-field { flex: 1; height: 40px; border: 1px solid #000000; padding: 0 12px; font-family: sans-serif; font-size: 14px; box-sizing: border-box; outline: none; background: #ffffff; color: #000000; border-radius: 0; -webkit-appearance: none; }
-        .input-field:disabled { background: #f5f5f5; border-color: #cccccc; color: #999999; }
-
-        .send-btn { height: 40px; padding: 0 20px; background: #000000; color: #ffffff; border: 1px solid #000000; font-family: sans-serif; font-size: 14px; cursor: pointer; box-sizing: border-box; font-weight: bold; border-radius: 0; -webkit-appearance: none; }
-        .send-btn:hover { background: #333333; border-color: #333333; }
-        .send-btn:disabled { background: #cccccc; border-color: #cccccc; color: #666666; cursor: not-allowed; }
+        .avatar:hover { transform: scale(1.05); }
+        .avatar:active { transform: scale(0.95); }
         
-        .warning {
+        .msg-body { flex: 1; }
+        .msg-header { font-size: 13px; font-weight: bold; margin-bottom: 4px; }
+        .msg-time { font-size: 11px; color: #888; font-weight: normal; margin-left: 8px; }
+        .msg-text { font-size: 14px; word-break: break-word; line-height: 1.4; color: #333; }
+        
+        .input-panel { 
+            padding: 15px 20px; 
+            border-top: 1px solid #e0e0e0; 
+            display: flex; 
+            gap: 10px; 
+            background: white;
+        }
+        
+        .input-field { 
+            flex: 1; 
+            height: 42px; 
+            border: 1px solid #ddd; 
+            padding: 0 15px; 
+            font-size: 14px; 
+            border-radius: 21px;
+            outline: none;
+        }
+        
+        .input-field:focus { border-color: #000; }
+        
+        .send-btn { 
+            height: 42px; 
+            padding: 0 25px; 
+            background: #000; 
+            color: white; 
+            border: none; 
+            border-radius: 21px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        
+        .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .toast {
             position: fixed;
             bottom: 80px;
-            left: 20px;
-            right: 20px;
-            background: #ff4444;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #333;
             color: white;
-            padding: 10px;
-            text-align: center;
-            font-size: 12px;
-            border-radius: 4px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 13px;
             z-index: 1000;
             animation: slideUp 0.3s ease;
+            pointer-events: none;
         }
         
         @keyframes slideUp {
-            from { transform: translateY(100%); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
+            from { opacity: 0; transform: translateX(-50%) translateY(20px); }
+            to { opacity: 1; transform: translateX(-50%) translateY(0); }
         }
+        
+        .report-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+        }
+        
+        .report-modal.show { display: flex; }
+        
+        .report-content {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            width: 280px;
+            text-align: center;
+        }
+        
+        .report-content textarea {
+            width: 100%;
+            height: 80px;
+            margin: 15px 0;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            resize: none;
+            font-family: inherit;
+        }
+        
+        .report-content button {
+            padding: 8px 16px;
+            margin: 0 5px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        
+        .report-submit { background: #ff4444; color: white; }
+        .report-cancel { background: #ddd; }
     </style>
 </head>
 <body>
-
-    <div class="app-container">
-        <div class="chat-area" id="chat-box"></div>
-
-        <div class="input-panel">
-            <input type="text" id="msg-input" class="input-field" placeholder="max 100 characters..." autocomplete="off" maxlength="100">
-            <button id="send-button" class="send-btn">send</button>
+    <div class="chat-area" id="chat-box"></div>
+    <div class="input-panel">
+        <input type="text" id="msg-input" class="input-field" placeholder="max 100 characters..." maxlength="100">
+        <button id="send-button" class="send-btn">send</button>
+    </div>
+    
+    <div id="report-modal" class="report-modal">
+        <div class="report-content">
+            <h4>Report user</h4>
+            <textarea id="report-reason" placeholder="Reason..."></textarea>
+            <div>
+                <button class="report-submit" id="report-submit">Submit</button>
+                <button class="report-cancel" id="report-cancel">Cancel</button>
+            </div>
         </div>
     </div>
 
     <script>
-        (function() {
-            const endpoint = window.location.origin;
-            const chatBox = document.getElementById('chat-box');
-            const msgInput = document.getElementById('msg-input');
-            const sendButton = document.getElementById('send-button');
-            const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
+        const endpoint = window.location.origin;
+        const chatBox = document.getElementById('chat-box');
+        const msgInput = document.getElementById('msg-input');
+        const sendButton = document.getElementById('send-button');
+        const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
+        
+        let lastMessageId = -1;
+        let isCooldown = false;
+        let pendingReportId = null;
+        let clickCount = 0;
+        let clickTimer = null;
+        
+        function showToast(msg, isError = false) {
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.textContent = msg;
+            toast.style.background = isError ? '#ff4444' : '#333';
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+        
+        function appendMessage(msg) {
+            if (document.getElementById(`msg-${msg.id}`)) return;
             
-            let lastMessageId = -1;
-            let isCooldown = false;
-            let messageQueue = [];
+            const msgElement = document.createElement('div');
+            msgElement.id = `msg-${msg.id}`;
+            msgElement.className = 'message';
+            msgElement.innerHTML = `
+                <img src="${avatarUrl}" class="avatar" data-id="${msg.id}" alt="anon">
+                <div class="msg-body">
+                    <div class="msg-header">anonymous<span class="msg-time">${escapeHTML(msg.timestamp)}</span></div>
+                    <div class="msg-text">${escapeHTML(msg.text)}</div>
+                </div>
+            `;
+            chatBox.appendChild(msgElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+        
+        function escapeHTML(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        
+        // СЕКРЕТНАЯ ФУНКЦИЯ: тройной клик по аватарке
+        function setupReportSystem() {
+            document.addEventListener('click', (e) => {
+                const avatar = e.target.closest('.avatar');
+                if (!avatar) return;
+                
+                const msgId = avatar.getAttribute('data-id');
+                if (!msgId) return;
+                
+                clickCount++;
+                clearTimeout(clickTimer);
+                
+                if (clickCount >= 3) {
+                    clickCount = 0;
+                    openReportModal(msgId);
+                } else {
+                    clickTimer = setTimeout(() => {
+                        clickCount = 0;
+                    }, 500);
+                }
+            });
+        }
+        
+        function openReportModal(msgId) {
+            pendingReportId = msgId;
+            document.getElementById('report-modal').classList.add('show');
+            document.getElementById('report-reason').value = '';
+        }
+        
+        async function submitReport() {
+            if (!pendingReportId) return;
             
-            function showWarning(message) {
-                const existing = document.querySelector('.warning');
-                if (existing) existing.remove();
-                
-                const warning = document.createElement('div');
-                warning.className = 'warning';
-                warning.textContent = message;
-                document.body.appendChild(warning);
-                
-                setTimeout(() => warning.remove(), 3000);
+            const reason = document.getElementById('report-reason').value.trim();
+            if (!reason) {
+                showToast('Enter a reason', true);
+                return;
             }
             
-            function appendMessage(msg) {
-                if (document.getElementById(`msg-${msg.id}`)) return;
+            try {
+                const res = await fetch(`${endpoint}/report`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ targetId: pendingReportId, reason })
+                });
                 
-                const msgElement = document.createElement('div');
-                msgElement.id = `msg-${msg.id}`;
-                msgElement.className = 'message';
-                msgElement.innerHTML = `
-                    <img src="${avatarUrl}" class="avatar" alt="anon">
-                    <div class="msg-body">
-                        <div class="msg-header">anonymous<span class="msg-time">${msg.timestamp}</span></div>
-                        <div class="msg-text">${escapeHTML(msg.text)}</div>
-                    </div>
-                `;
-                chatBox.appendChild(msgElement);
-                chatBox.scrollTop = chatBox.scrollHeight;
-            }
-            
-            function escapeHTML(str) {
-                return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-            }
-            
-            async function sendMessage(text) {
-                if (!text || text.length > 100 || isCooldown) return false;
+                const data = await res.json();
                 
-                // Антиспам фильтр на клиенте (повторяющиеся символы)
-                if (/(.)\1{9,}/.test(text)) {
-                    showWarning('no spam patterns allowed');
-                    return false;
+                if (data.banned) {
+                    showToast('✅ User has been banned!');
+                    setTimeout(() => location.reload(), 2000);
+                } else {
+                    showToast('Report submitted');
                 }
                 
+                closeReportModal();
+            } catch(e) {
+                showToast('Error submitting report', true);
+            }
+        }
+        
+        function closeReportModal() {
+            document.getElementById('report-modal').classList.remove('show');
+            pendingReportId = null;
+        }
+        
+        async function sendMessage() {
+            const text = msgInput.value.trim();
+            if (!text || text.length > 100 || isCooldown) return;
+            
+            msgInput.value = '';
+            startCooldown();
+            
+            try {
+                const res = await fetch(`${endpoint}/send`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                
+                if (res.status === 429) {
+                    const msg = await res.text();
+                    showToast(msg, true);
+                } else if (res.status === 403) {
+                    showToast('You are banned!', true);
+                    setTimeout(() => location.reload(), 2000);
+                }
+            } catch (e) {
+                console.log('send error');
+            }
+        }
+        
+        function startCooldown() {
+            isCooldown = true;
+            sendButton.disabled = true;
+            msgInput.disabled = true;
+            
+            let secondsLeft = 2;
+            msgInput.placeholder = `wait ${secondsLeft}s...`;
+            
+            const interval = setInterval(() => {
+                secondsLeft--;
+                if (secondsLeft > 0) {
+                    msgInput.placeholder = `wait ${secondsLeft}s...`;
+                } else {
+                    clearInterval(interval);
+                    isCooldown = false;
+                    sendButton.disabled = false;
+                    msgInput.disabled = false;
+                    msgInput.placeholder = "max 100 characters...";
+                    msgInput.focus();
+                }
+            }, 1000);
+        }
+        
+        async function listenForMessages() {
+            while (true) {
                 try {
-                    const res = await fetch(`${endpoint}/send`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ text })
-                    });
-                    
-                    if (res.status === 429) {
-                        const message = await res.text();
-                        showWarning(message);
-                        return false;
-                    } else if (res.status === 400) {
-                        const message = await res.text();
-                        showWarning(message);
-                        return false;
-                    } else if (res.ok) {
-                        return true;
+                    const res = await fetch(`${endpoint}/messages?lastId=${lastMessageId}`);
+                    if (res.status === 200) {
+                        const msgs = await res.json();
+                        msgs.forEach(msg => {
+                            appendMessage(msg);
+                            if (msg.id > lastMessageId) {
+                                lastMessageId = msg.id;
+                            }
+                        });
                     }
                 } catch (e) {
-                    showWarning('connection error, try again');
-                    return false;
-                }
-                return false;
-            }
-            
-            function startCooldown() {
-                isCooldown = true;
-                sendButton.disabled = true;
-                msgInput.disabled = true;
-                
-                let secondsLeft = 2;
-                msgInput.placeholder = `wait ${secondsLeft}s...`;
-                
-                const interval = setInterval(() => {
-                    secondsLeft--;
-                    if (secondsLeft > 0) {
-                        msgInput.placeholder = `wait ${secondsLeft}s...`;
-                    } else {
-                        clearInterval(interval);
-                        isCooldown = false;
-                        sendButton.disabled = false;
-                        msgInput.disabled = false;
-                        msgInput.placeholder = "max 100 characters...";
-                        msgInput.focus();
-                        
-                        if (messageQueue.length > 0) {
-                            const nextText = messageQueue.shift();
-                            handleSend(nextText);
-                        }
-                    }
-                }, 1000);
-            }
-            
-            async function handleSend(text) {
-                if (isCooldown) {
-                    messageQueue.push(text);
-                    return;
-                }
-                
-                const success = await sendMessage(text);
-                if (success) {
-                    msgInput.value = '';
-                    startCooldown();
-                } else if (messageQueue.length === 0) {
-                    msgInput.value = '';
+                    await new Promise(r => setTimeout(r, 2000));
                 }
             }
-            
-            async function listenForMessages() {
-                while (true) {
-                    try {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 30000);
-                        
-                        const res = await fetch(`${endpoint}/messages?lastId=${lastMessageId}`, {
-                            signal: controller.signal
-                        });
-                        clearTimeout(timeoutId);
-                        
-                        if (res.status === 200) {
-                            const msgs = await res.json();
-                            msgs.forEach(msg => {
-                                appendMessage(msg);
-                                if (msg.id > lastMessageId) {
-                                    lastMessageId = msg.id;
-                                }
-                            });
-                        }
-                    } catch (e) {
-                        await new Promise(r => setTimeout(r, 2000));
-                    }
-                }
+        }
+        
+        msgInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !isCooldown) {
+                sendMessage();
             }
-            
-            window.sendMessage = function() {
-                const text = msgInput.value.trim();
-                if (text && !isCooldown) {
-                    handleSend(text);
-                }
-            };
-            
-            msgInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && !isCooldown) {
-                    e.preventDefault();
-                    const text = msgInput.value.trim();
-                    if (text) {
-                        handleSend(text);
-                    }
-                }
-            });
-            
-            sendButton.addEventListener('click', () => {
-                const text = msgInput.value.trim();
-                if (text && !isCooldown) {
-                    handleSend(text);
-                }
-            });
-            
-            window.addEventListener('resize', () => {
-                chatBox.scrollTop = chatBox.scrollHeight;
-            });
-            
-            listenForMessages();
-        })();
+        });
+        
+        sendButton.addEventListener('click', sendMessage);
+        document.getElementById('report-submit').addEventListener('click', submitReport);
+        document.getElementById('report-cancel').addEventListener('click', closeReportModal);
+        
+        setupReportSystem();
+        listenForMessages();
     </script>
 </body>
 </html>
