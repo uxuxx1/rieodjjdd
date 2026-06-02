@@ -10,7 +10,9 @@ const db = new sqlite3.Database(dbPath);
 let clients = [];
 const cooldowns = new Map();
 const dailyCounts = new Map();
-const bannedIPs = new Map(); // IP -> причина и время бана
+const bannedIPs = new Map(); // IP -> время бана
+const ipToHash = new Map(); // IP -> хэш (для обратного поиска)
+const hashToIp = new Map(); // хэш -> IP
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -20,7 +22,6 @@ db.serialize(() => {
         ip_hash TEXT NOT NULL
     )`);
     
-    // Таблица для жалоб
     db.run(`CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target_ip_hash TEXT NOT NULL,
@@ -45,10 +46,29 @@ function hashIp(ip) {
 function isBanned(ip) {
     if (bannedIPs.has(ip)) {
         const banTime = bannedIPs.get(ip);
-        if (Date.now() - banTime < 3600000) { // Бан на час
+        if (Date.now() - banTime < 3600000) {
             return true;
         } else {
-            bannedIPs.delete(ip); // Снимаем бан через час
+            bannedIPs.delete(ip);
+        }
+    }
+    return false;
+}
+
+function banIp(ip) {
+    bannedIPs.set(ip, Date.now());
+    console.log(`[BAN] IP ${ip} has been banned`);
+}
+
+function unbanByHash(targetHash) {
+    // Ищем IP по хэшу
+    for (let [ip, hash] of ipToHash.entries()) {
+        if (hash === targetHash) {
+            if (bannedIPs.has(ip)) {
+                bannedIPs.delete(ip);
+                console.log(`[UNBAN] IP ${ip} (hash: ${targetHash}) has been unbanned`);
+                return true;
+            }
         }
     }
     return false;
@@ -68,7 +88,10 @@ const server = http.createServer((req, res) => {
     const ip = getRealIp(req);
     const ipHash = hashIp(ip);
     
-    // Проверка бана
+    // Сохраняем соответствие IP <-> хэш
+    ipToHash.set(ip, ipHash);
+    hashToIp.set(ipHash, ip);
+    
     if (isBanned(ip)) {
         res.writeHead(403);
         res.end('BANNED: Spamming detected');
@@ -93,8 +116,8 @@ const server = http.createServer((req, res) => {
         req.on('end', () => {
             try {
                 const { targetId, reason } = JSON.parse(body);
+                const reasonLower = reason.toLowerCase();
                 
-                // Получаем IP автора сообщения из БД
                 db.get('SELECT ip_hash FROM messages WHERE id = ?', [targetId], (err, msg) => {
                     if (err || !msg) {
                         res.writeHead(404);
@@ -102,17 +125,25 @@ const server = http.createServer((req, res) => {
                         return;
                     }
                     
-                    // Секретные слова для бана
-                    const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
-                    const shouldBan = banKeywords.some(keyword => 
-                        reason.toLowerCase().includes(keyword)
-                    );
+                    let isBanned = false;
+                    let isUnbanned = false;
                     
-                    if (shouldBan) {
-                        // Нужно найти реальный IP по хэшу (в проде так не делают, но у нас маленький чат)
-                        // В реальности нужно хранить соответствие IP -> хэш, но для простоты:
-                        bannedIPs.set(ip, Date.now());
-                        console.log(`[BAN] IP ${ip} banned for reason: ${reason}`);
+                    // Секретные слова для БАНА
+                    const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
+                    const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
+                    
+                    // Секретное слово для РАЗБАНА
+                    if (reasonLower === 'аннблак') {
+                        isUnbanned = unbanByHash(msg.ip_hash);
+                    }
+                    // Если не разбан, то может быть бан
+                    else if (shouldBan) {
+                        // Находим IP по хэшу и баним
+                        const targetIp = hashToIp.get(msg.ip_hash);
+                        if (targetIp) {
+                            banIp(targetIp);
+                            isBanned = true;
+                        }
                     }
                     
                     // Сохраняем жалобу в БД
@@ -121,9 +152,14 @@ const server = http.createServer((req, res) => {
                         [msg.ip_hash, ipHash, reason, timestamp]);
                     
                     res.writeHead(200);
-                    res.end(JSON.stringify({ success: true, banned: shouldBan }));
+                    res.end(JSON.stringify({ 
+                        success: true, 
+                        banned: isBanned,
+                        unbanned: isUnbanned
+                    }));
                 });
             } catch(e) {
+                console.error(e);
                 res.writeHead(400);
                 res.end();
             }
@@ -154,7 +190,6 @@ const server = http.createServer((req, res) => {
     else if (req.url === '/send' && req.method === 'POST') {
         const now = Date.now();
         
-        // Лимит 30 сообщений в день
         const today = new Date().toDateString();
         let daily = dailyCounts.get(ip) || { count: 0, day: today };
         if (daily.day !== today) {
@@ -194,7 +229,6 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                // Блокировка спама повторяющимися символами
                 if (/(.)\1{15,}/.test(text)) {
                     res.writeHead(400);
                     res.end('No spam patterns');
@@ -242,14 +276,13 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// Очистка
 setInterval(() => {
     const now = Date.now();
     for (const [ip, time] of cooldowns.entries()) {
         if (now - time > 5000) cooldowns.delete(ip);
     }
     for (const [ip, time] of bannedIPs.entries()) {
-        if (now - time > 3600000) bannedIPs.delete(ip); // Авторазбан через час
+        if (now - time > 3600000) bannedIPs.delete(ip);
     }
 }, 30000);
 
