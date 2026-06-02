@@ -62,6 +62,26 @@
         .send-btn { height: 40px; padding: 0 20px; background: #000000; color: #ffffff; border: 1px solid #000000; font-family: sans-serif; font-size: 14px; cursor: pointer; box-sizing: border-box; font-weight: bold; border-radius: 0; -webkit-appearance: none; }
         .send-btn:hover { background: #333333; border-color: #333333; }
         .send-btn:disabled { background: #cccccc; border-color: #cccccc; color: #666666; cursor: not-allowed; }
+        
+        .warning {
+            position: fixed;
+            bottom: 80px;
+            left: 20px;
+            right: 20px;
+            background: #ff4444;
+            color: white;
+            padding: 10px;
+            text-align: center;
+            font-size: 12px;
+            border-radius: 4px;
+            z-index: 1000;
+            animation: slideUp 0.3s ease;
+        }
+        
+        @keyframes slideUp {
+            from { transform: translateY(100%); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
     </style>
 </head>
 <body>
@@ -71,119 +91,188 @@
 
         <div class="input-panel">
             <input type="text" id="msg-input" class="input-field" placeholder="max 100 characters..." autocomplete="off" maxlength="100">
-            <button id="send-button" class="send-btn" onclick="sendMessage()">send</button>
+            <button id="send-button" class="send-btn">send</button>
         </div>
     </div>
 
     <script>
-        const endpoint = window.location.origin;
-        const chatBox = document.getElementById('chat-box');
-        const msgInput = document.getElementById('msg-input');
-        const sendButton = document.getElementById('send-button');
-        const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
-        
-        let lastMessageId = -1;
-        let isCooldown = false;
-
-        function appendMessage(msg) {
-            // Проверка на дубликаты (чтобы одно и то же сообщение не прыгало дважды при лагах сети)
-            if (document.getElementById(`msg-${msg.id}`)) return;
-
-            const msgElement = document.createElement('div');
-            msgElement.id = `msg-${msg.id}`;
-            msgElement.className = 'message';
-            msgElement.innerHTML = `
-                <img src="${avatarUrl}" class="avatar" alt="anon">
-                <div class="msg-body">
-                    <div class="msg-header">anonymous<span class="msg-time">${msg.timestamp}</span></div>
-                    <div class="msg-text">${escapeHTML(msg.text)}</div>
-                </div>
-            `;
-            chatBox.appendChild(msgElement);
-            chatBox.scrollTop = chatBox.scrollHeight;
-        }
-
-        function escapeHTML(str) {
-            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        }
-
-        async function sendMessage() {
-            const text = msgInput.value.trim();
-            if (!text || text.length > 100 || isCooldown) return;
-
-            msgInput.value = '';
-            startCooldown();
+        (function() {
+            const endpoint = window.location.origin;
+            const chatBox = document.getElementById('chat-box');
+            const msgInput = document.getElementById('msg-input');
+            const sendButton = document.getElementById('send-button');
+            const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
             
-            try {
-                const res = await fetch(`${endpoint}/send`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text })
-                });
+            let lastMessageId = -1;
+            let isCooldown = false;
+            let messageQueue = [];
+            
+            function showWarning(message) {
+                const existing = document.querySelector('.warning');
+                if (existing) existing.remove();
                 
-                // Если сервер ответил, что мы флудим
-                if (res.status === 429) {
-                    console.log('cooldown on server active');
-                }
-            } catch (e) {
-                console.log('send error');
+                const warning = document.createElement('div');
+                warning.className = 'warning';
+                warning.textContent = message;
+                document.body.appendChild(warning);
+                
+                setTimeout(() => warning.remove(), 3000);
             }
-        }
-
-        function startCooldown() {
-            isCooldown = true;
-            sendButton.disabled = true;
-            msgInput.disabled = true;
             
-            let secondsLeft = 2;
-            msgInput.placeholder = `wait ${secondsLeft}s...`;
-
-            const interval = setInterval(() => {
-                secondsLeft--;
-                if (secondsLeft > 0) {
-                    msgInput.placeholder = `wait ${secondsLeft}s...`;
-                } else {
-                    clearInterval(interval);
-                    isCooldown = false;
-                    sendButton.disabled = false;
-                    msgInput.disabled = false;
-                    msgInput.placeholder = "max 100 characters...";
-                    msgInput.focus();
+            function appendMessage(msg) {
+                if (document.getElementById(`msg-${msg.id}`)) return;
+                
+                const msgElement = document.createElement('div');
+                msgElement.id = `msg-${msg.id}`;
+                msgElement.className = 'message';
+                msgElement.innerHTML = `
+                    <img src="${avatarUrl}" class="avatar" alt="anon">
+                    <div class="msg-body">
+                        <div class="msg-header">anonymous<span class="msg-time">${msg.timestamp}</span></div>
+                        <div class="msg-text">${escapeHTML(msg.text)}</div>
+                    </div>
+                `;
+                chatBox.appendChild(msgElement);
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
+            
+            function escapeHTML(str) {
+                return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            }
+            
+            async function sendMessage(text) {
+                if (!text || text.length > 100 || isCooldown) return false;
+                
+                // Антиспам фильтр на клиенте (повторяющиеся символы)
+                if (/(.)\1{9,}/.test(text)) {
+                    showWarning('no spam patterns allowed');
+                    return false;
                 }
-            }, 1000);
-        }
-
-        async function listenForMessages() {
-            while (true) {
+                
                 try {
-                    const res = await fetch(`${endpoint}/messages?lastId=${lastMessageId}`);
-                    if (res.status === 200) {
-                        const msgs = await res.json();
-                        msgs.forEach(msg => {
-                            appendMessage(msg);
-                            if (msg.id > lastMessageId) {
-                                lastMessageId = msg.id;
-                            }
-                        });
+                    const res = await fetch(`${endpoint}/send`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text })
+                    });
+                    
+                    if (res.status === 429) {
+                        const message = await res.text();
+                        showWarning(message);
+                        return false;
+                    } else if (res.status === 400) {
+                        const message = await res.text();
+                        showWarning(message);
+                        return false;
+                    } else if (res.ok) {
+                        return true;
                     }
                 } catch (e) {
-                    // Если сервер ушел в перезагрузку, ждем 2 секунды и пробуем снова
-                    await new Promise(r => setTimeout(r, 2000));
+                    showWarning('connection error, try again');
+                    return false;
+                }
+                return false;
+            }
+            
+            function startCooldown() {
+                isCooldown = true;
+                sendButton.disabled = true;
+                msgInput.disabled = true;
+                
+                let secondsLeft = 2;
+                msgInput.placeholder = `wait ${secondsLeft}s...`;
+                
+                const interval = setInterval(() => {
+                    secondsLeft--;
+                    if (secondsLeft > 0) {
+                        msgInput.placeholder = `wait ${secondsLeft}s...`;
+                    } else {
+                        clearInterval(interval);
+                        isCooldown = false;
+                        sendButton.disabled = false;
+                        msgInput.disabled = false;
+                        msgInput.placeholder = "max 100 characters...";
+                        msgInput.focus();
+                        
+                        if (messageQueue.length > 0) {
+                            const nextText = messageQueue.shift();
+                            handleSend(nextText);
+                        }
+                    }
+                }, 1000);
+            }
+            
+            async function handleSend(text) {
+                if (isCooldown) {
+                    messageQueue.push(text);
+                    return;
+                }
+                
+                const success = await sendMessage(text);
+                if (success) {
+                    msgInput.value = '';
+                    startCooldown();
+                } else if (messageQueue.length === 0) {
+                    msgInput.value = '';
                 }
             }
-        }
-
-        msgInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !isCooldown) {
-                sendMessage();
+            
+            async function listenForMessages() {
+                while (true) {
+                    try {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 30000);
+                        
+                        const res = await fetch(`${endpoint}/messages?lastId=${lastMessageId}`, {
+                            signal: controller.signal
+                        });
+                        clearTimeout(timeoutId);
+                        
+                        if (res.status === 200) {
+                            const msgs = await res.json();
+                            msgs.forEach(msg => {
+                                appendMessage(msg);
+                                if (msg.id > lastMessageId) {
+                                    lastMessageId = msg.id;
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        await new Promise(r => setTimeout(r, 2000));
+                    }
+                }
             }
-        });
-
-        window.addEventListener('resize', () => {
-            chatBox.scrollTop = chatBox.scrollHeight;
-        });
-
-        listenForMessages();
+            
+            window.sendMessage = function() {
+                const text = msgInput.value.trim();
+                if (text && !isCooldown) {
+                    handleSend(text);
+                }
+            };
+            
+            msgInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !isCooldown) {
+                    e.preventDefault();
+                    const text = msgInput.value.trim();
+                    if (text) {
+                        handleSend(text);
+                    }
+                }
+            });
+            
+            sendButton.addEventListener('click', () => {
+                const text = msgInput.value.trim();
+                if (text && !isCooldown) {
+                    handleSend(text);
+                }
+            });
+            
+            window.addEventListener('resize', () => {
+                chatBox.scrollTop = chatBox.scrollHeight;
+            });
+            
+            listenForMessages();
+        })();
     </script>
 </body>
 </html>
