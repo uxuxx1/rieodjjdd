@@ -13,12 +13,25 @@ const bannedIPs = new Map();
 const ipToHash = new Map();
 const hashToIp = new Map();
 
+// Для антиспам системы
+const messageHistory = new Map(); // ip -> [{text, timestamp}]
+const dailyCounts = new Map(); // ip -> {count, day}
+const consecutiveMessages = new Map(); // ip -> {count, lastText, lastTime}
+const uppercaseWarnings = new Map(); // ip -> uppercaseCount
+
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         text TEXT NOT NULL,
+        username TEXT DEFAULT '',
         timestamp TEXT NOT NULL,
         ip_hash TEXT NOT NULL
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        ip_hash TEXT PRIMARY KEY,
+        username TEXT DEFAULT '',
+        updated_at INTEGER
     )`);
     
     db.run(`CREATE TABLE IF NOT EXISTS reports (
@@ -54,9 +67,9 @@ function isBanned(ip) {
     return false;
 }
 
-function banIp(ip) {
+function banIp(ip, reason) {
     bannedIPs.set(ip, Date.now());
-    console.log(`[BAN] IP ${ip} has been banned`);
+    console.log(`[BAN] IP ${ip} - ${reason}`);
 }
 
 function unbanByHash(targetHash) {
@@ -64,7 +77,7 @@ function unbanByHash(targetHash) {
         if (hash === targetHash) {
             if (bannedIPs.has(ip)) {
                 bannedIPs.delete(ip);
-                console.log(`[UNBAN] IP ${ip} has been unbanned`);
+                console.log(`[UNBAN] IP ${ip}`);
                 return true;
             }
         }
@@ -73,15 +86,100 @@ function unbanByHash(targetHash) {
 }
 
 function clearAllMessages() {
-    db.run('DELETE FROM messages', (err) => {
-        if (err) {
-            console.error('Failed to clear messages:', err);
-        } else {
-            console.log('[CLEAR] All messages deleted');
-            // Сбросим счетчик ID
-            db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
-        }
+    db.run('DELETE FROM messages');
+    db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
+    console.log('[CLEAR] All messages deleted');
+}
+
+function getUsername(ipHash, callback) {
+    db.get('SELECT username FROM users WHERE ip_hash = ?', [ipHash], (err, row) => {
+        callback(err || !row ? '' : (row.username || ''));
     });
+}
+
+function setUsername(ipHash, username, callback) {
+    const now = Date.now();
+    db.run(`INSERT OR REPLACE INTO users (ip_hash, username, updated_at) VALUES (?, ?, ?)`,
+        [ipHash, username.substring(0, 10), now], callback);
+}
+
+function isUsernameTaken(username, excludeHash, callback) {
+    db.get('SELECT ip_hash FROM users WHERE username = ? AND ip_hash != ?', [username, excludeHash], (err, row) => {
+        callback(!err && row);
+    });
+}
+
+function checkSpamRules(ip, text, callback) {
+    const now = Date.now();
+    const twoMinutes = 120000;
+    const fiveSameMessages = 5;
+    const tenSameMessages = 10;
+    const fiftyConsecutive = 50;
+    const tenUppercase = 10;
+    
+    // Получаем историю
+    let history = messageHistory.get(ip) || [];
+    history = history.filter(m => now - m.timestamp < twoMinutes);
+    
+    // 1. 10 одинаковых сообщений за 2 минуты
+    const sameIn2min = history.filter(m => m.text === text).length;
+    if (sameIn2min + 1 >= tenSameMessages) {
+        banIp(ip, `10 identical messages in 2 minutes: "${text}"`);
+        callback(true, '10 identical messages in 2 minutes - banned');
+        return;
+    }
+    
+    // 2. 5 одинаковых сообщений подряд
+    const consecutive = consecutiveMessages.get(ip) || { count: 0, lastText: '' };
+    if (consecutive.lastText === text) {
+        consecutive.count++;
+        if (consecutive.count >= fiveSameMessages) {
+            banIp(ip, `5 identical messages in a row: "${text}"`);
+            callback(true, '5 identical messages in a row - banned');
+            return;
+        }
+    } else {
+        consecutive.count = 1;
+        consecutive.lastText = text;
+    }
+    consecutiveMessages.set(ip, consecutive);
+    
+    // 3. 50 сообщений подряд без перебивания другими IP
+    // Считаем все последние сообщения в чате (нужно глобально, но упрощенно через историю)
+    const globalHistory = messageHistory.get('global') || [];
+    const last50FromSame = globalHistory.filter(m => m.ip === ip).slice(-50).length;
+    if (last50FromSame >= 50) {
+        banIp(ip, `50 consecutive messages without interruption`);
+        callback(true, '50 consecutive messages - banned');
+        return;
+    }
+    
+    // 4. 10 сообщений подряд ЗАГЛАВНЫМИ буквами
+    const isUppercase = text === text.toUpperCase() && text !== text.toLowerCase() && text.length > 3;
+    let upperCount = uppercaseWarnings.get(ip) || 0;
+    if (isUppercase) {
+        upperCount++;
+        if (upperCount >= tenUppercase) {
+            banIp(ip, `10 uppercase messages in a row`);
+            callback(true, '10 uppercase messages in a row - banned');
+            return;
+        }
+    } else {
+        upperCount = 0;
+    }
+    uppercaseWarnings.set(ip, upperCount);
+    
+    // Обновляем историю
+    history.push({ text, timestamp: now });
+    messageHistory.set(ip, history);
+    
+    // Обновляем глобальную историю для правила 50 подряд
+    let global = messageHistory.get('global') || [];
+    global.push({ ip, timestamp: now });
+    global = global.filter(m => now - m.timestamp < 300000); // последние 5 минут
+    messageHistory.set('global', global);
+    
+    callback(false, 'ok');
 }
 
 const server = http.createServer((req, res) => {
@@ -103,7 +201,7 @@ const server = http.createServer((req, res) => {
     
     if (isBanned(ip)) {
         res.writeHead(403);
-        res.end('BANNED: Spamming detected');
+        res.end('BANNED');
         return;
     }
 
@@ -111,13 +209,48 @@ const server = http.createServer((req, res) => {
         fs.readFile(path.join(__dirname, 'index.html'), (err, content) => {
             if (err) {
                 res.writeHead(500);
-                res.end('error loading index.html');
+                res.end();
             } else {
                 res.writeHead(200, { 'Content-Type': 'text/html' });
                 res.end(content);
             }
         });
-    } 
+    }
+    
+    else if (req.url === '/username' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const { username } = JSON.parse(body);
+                const cleanUsername = username ? username.trim().substring(0, 10) : '';
+                
+                isUsernameTaken(cleanUsername, ipHash, (taken) => {
+                    if (taken) {
+                        res.writeHead(409);
+                        res.end(JSON.stringify({ error: 'Username already taken' }));
+                    } else {
+                        setUsername(ipHash, cleanUsername, () => {
+                            res.writeHead(200);
+                            res.end(JSON.stringify({ username: cleanUsername }));
+                        });
+                    }
+                });
+            } catch(e) {
+                res.writeHead(400);
+                res.end();
+            }
+        });
+        return;
+    }
+    
+    else if (req.url === '/username' && req.method === 'GET') {
+        getUsername(ipHash, (username) => {
+            res.writeHead(200);
+            res.end(JSON.stringify({ username: username || '' }));
+        });
+        return;
+    }
     
     else if (req.url === '/report' && req.method === 'POST') {
         let body = '';
@@ -130,33 +263,28 @@ const server = http.createServer((req, res) => {
                 db.get('SELECT ip_hash FROM messages WHERE id = ?', [targetId], (err, msg) => {
                     if (err || !msg) {
                         res.writeHead(404);
-                        res.end('Message not found');
+                        res.end();
                         return;
                     }
                     
-                    let isBanned = false;
+                    let isBannedFlag = false;
                     let isUnbanned = false;
                     let isCleared = false;
                     
-                    // Секретное слово для ОЧИСТКИ ЧАТА
                     if (reasonLower === 'каша') {
                         clearAllMessages();
                         isCleared = true;
-                    }
-                    // Секретные слова для БАНА
-                    else {
+                    } else {
                         const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
                         const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
                         
-                        // Секретное слово для РАЗБАНА
                         if (reasonLower === 'аннблак') {
                             isUnbanned = unbanByHash(msg.ip_hash);
-                        }
-                        else if (shouldBan) {
+                        } else if (shouldBan) {
                             const targetIp = hashToIp.get(msg.ip_hash);
                             if (targetIp) {
-                                banIp(targetIp);
-                                isBanned = true;
+                                banIp(targetIp, 'reported as spammer');
+                                isBannedFlag = true;
                             }
                         }
                     }
@@ -165,7 +293,6 @@ const server = http.createServer((req, res) => {
                     db.run('INSERT INTO reports (target_ip_hash, reporter_ip_hash, reason, timestamp) VALUES (?, ?, ?, ?)',
                         [msg.ip_hash, ipHash, reason, timestamp]);
                     
-                    // Оповещаем всех клиентов об очистке чата
                     if (isCleared) {
                         const currentClients = clients;
                         clients = [];
@@ -180,13 +307,12 @@ const server = http.createServer((req, res) => {
                     res.writeHead(200);
                     res.end(JSON.stringify({ 
                         success: true, 
-                        banned: isBanned,
+                        banned: isBannedFlag,
                         unbanned: isUnbanned,
                         cleared: isCleared
                     }));
                 });
             } catch(e) {
-                console.error(e);
                 res.writeHead(400);
                 res.end();
             }
@@ -198,7 +324,7 @@ const server = http.createServer((req, res) => {
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
 
-        db.all('SELECT id, text, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
+        db.all('SELECT id, text, username, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
@@ -217,9 +343,22 @@ const server = http.createServer((req, res) => {
     else if (req.url === '/send' && req.method === 'POST') {
         const now = Date.now();
         
+        // Кулдаун 2 секунды
         if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
             res.writeHead(429);
             res.end('Wait 2 seconds');
+            return;
+        }
+        
+        // Дневной лимит 1000 сообщений
+        const today = new Date().toDateString();
+        let daily = dailyCounts.get(ip) || { count: 0, day: today };
+        if (daily.day !== today) {
+            daily = { count: 0, day: today };
+        }
+        if (daily.count >= 1000) {
+            res.writeHead(429);
+            res.end('Daily limit: 1000 messages');
             return;
         }
 
@@ -238,7 +377,8 @@ const server = http.createServer((req, res) => {
             try {
                 const data = JSON.parse(body);
                 let text = data.text ? data.text.trim() : '';
-
+                let username = data.username ? data.username.trim().substring(0, 10) : '';
+                
                 if (text.length < 1 || text.length > 100) {
                     res.writeHead(400);
                     res.end('1-100 chars');
@@ -251,31 +391,44 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                cooldowns.set(ip, now);
-                
-                const timestamp = new Date().toLocaleTimeString();
-                
-                db.run('INSERT INTO messages (text, timestamp, ip_hash) VALUES (?, ?, ?)', 
-                    [text, timestamp, ipHash], 
-                    function(err) {
-                        if (err) return;
-
-                        const newMsg = { id: this.lastID, text, timestamp };
-
-                        db.run(`DELETE FROM messages WHERE id NOT IN (
-                            SELECT id FROM messages ORDER BY id DESC LIMIT 100
-                        )`);
-
-                        const currentClients = clients;
-                        clients = [];
-                        currentClients.forEach(client => {
-                            client.res.writeHead(200, { 'Content-Type': 'application/json' });
-                            client.res.end(JSON.stringify([newMsg]));
+                // Проверка спам-правил
+                checkSpamRules(ip, text, (banned, reason) => {
+                    if (banned) {
+                        res.writeHead(403);
+                        res.end(reason);
+                        return;
+                    }
+                    
+                    cooldowns.set(ip, now);
+                    daily.count++;
+                    dailyCounts.set(ip, daily);
+                    
+                    const timestamp = new Date().toLocaleTimeString();
+                    
+                    getUsername(ipHash, (finalUsername) => {
+                        db.run('INSERT INTO messages (text, username, timestamp, ip_hash) VALUES (?, ?, ?, ?)', 
+                            [text, finalUsername || username || '', timestamp, ipHash], 
+                            function(err) {
+                                if (err) return;
+                                
+                                const newMsg = { id: this.lastID, text, username: finalUsername || username || '', timestamp };
+                                
+                                db.run(`DELETE FROM messages WHERE id NOT IN (
+                                    SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                                )`);
+                                
+                                const currentClients = clients;
+                                clients = [];
+                                currentClients.forEach(client => {
+                                    client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                                    client.res.end(JSON.stringify([newMsg]));
+                                });
                         });
+                    });
+                    
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ success: true }));
                 });
-                
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true }));
                 
             } catch (e) {
                 res.writeHead(400);
@@ -297,6 +450,21 @@ setInterval(() => {
     }
     for (const [ip, time] of bannedIPs.entries()) {
         if (now - time > 3600000) bannedIPs.delete(ip);
+    }
+    // Очистка истории сообщений
+    for (const [ip, history] of messageHistory.entries()) {
+        if (ip === 'global') continue;
+        const filtered = history.filter(m => now - m.timestamp < 120000);
+        if (filtered.length === 0) {
+            messageHistory.delete(ip);
+        } else {
+            messageHistory.set(ip, filtered);
+        }
+    }
+    // Очистка глобальной истории
+    if (messageHistory.has('global')) {
+        const global = messageHistory.get('global').filter(m => now - m.timestamp < 300000);
+        messageHistory.set('global', global);
     }
 }, 30000);
 
