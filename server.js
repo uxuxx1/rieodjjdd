@@ -1,16 +1,22 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
 
-const colors = [
-    '#ff0000', '#990000', '#ff7f00', '#994c00', '#ffff00', '#999900',
-    '#00ff00', '#009900', '#0000ff', '#000099', '#4b0082', '#2e0051',
-    '#8b00ff', '#550099', '#ffffff', '#000000'
-];
+// Файл базы данных будет создан автоматически в той же папке
+const dbPath = path.join(__dirname, 'chat.db');
+const db = new sqlite3.Database(dbPath);
 
-const canvasSize = 500 * 500;
-let matrix = new Uint8Array(canvasSize);
-matrix.fill(14); // белый цвет по умолчанию
+let clients = [];
+
+// Создание таблицы при первом запуске
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    )`);
+});
 
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -23,7 +29,7 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // если человек просто зашел на сайт (корень /), отдаем ему index.html
+    // Отдача главного интерфейса
     if (req.url === '/' && req.method === 'GET') {
         fs.readFile(path.join(__dirname, 'index.html'), (err, content) => {
             if (err) {
@@ -36,29 +42,69 @@ const server = http.createServer((req, res) => {
         });
     } 
     
-    else if (req.url === '/matrix' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-        res.end(Buffer.from(matrix.buffer));
+    // Получение новых сообщений (Long Polling)
+    else if (req.url.startsWith('/messages') && req.method === 'GET') {
+        const urlParams = new URL(req.url, `http://${req.headers.host}`);
+        const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
+
+        db.all('SELECT * FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
+            if (err) {
+                res.writeHead(500);
+                res.end();
+                return;
+            }
+
+            if (rows.length > 0) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(rows));
+            } else {
+                clients.push({ res, lastId });
+            }
+        });
     } 
     
-    else if (req.url === '/draw' && req.method === 'POST') {
+    // Обработка отправки нового сообщения
+    else if (req.url === '/send' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => { body += chunk.toString(); });
         req.on('end', () => {
-            const data = JSON.parse(body);
-            const x = parseInt(data.x);
-            const y = parseInt(data.y);
-            const colorHex = data.color.toLowerCase();
+            try {
+                const data = JSON.parse(body);
+                const text = data.text ? data.text.trim() : '';
 
-            if (x >= 0 && x < 500 && y >= 0 && y < 500) {
-                const colorIdx = colors.indexOf(colorHex);
-                if (colorIdx !== -1) {
-                    const position = y * 500 + x;
-                    matrix[position] = colorIdx;
+                // Строгая проверка: только текст от 1 до 100 символов
+                if (text.length > 0 && text.length <= 100) {
+                    const timestamp = new Date().toLocaleTimeString();
+
+                    db.run('INSERT INTO messages (text, timestamp) VALUES (?, ?)', [text, timestamp], function(err) {
+                        if (err) return;
+
+                        const newMsg = { id: this.lastID, text, timestamp };
+
+                        // Автоматическая очистка: удаляем всё, что не входит в последние 100 сообщений
+                        db.run(`DELETE FROM messages WHERE id NOT IN (
+                            SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                        )`);
+
+                        // Моментальная рассылка всем, кто сейчас онлайн
+                        const currentClients = clients;
+                        clients = [];
+                        currentClients.forEach(client => {
+                            client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                            client.res.end(JSON.stringify([newMsg]));
+                        });
+                    });
+                    
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true }));
+                } else {
+                    res.writeHead(400);
+                    res.end('bad request: length must be 1-100 chars');
                 }
+            } catch (e) {
+                res.writeHead(400);
+                res.end();
             }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
         });
     } 
     
@@ -68,7 +114,7 @@ const server = http.createServer((req, res) => {
     }
 });
 
-const port = process.env.PORT || 3000;
-server.listen(port, () => {
-    console.log(`grid engine active on port ${port}`);
+const port = Number(process.env.PORT) || 8080;
+server.listen(port, '0.0.0.0', () => {
+    console.log(`chat engine active on port ${port}`);
 });
