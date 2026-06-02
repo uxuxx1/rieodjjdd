@@ -70,8 +70,8 @@
         <div class="chat-area" id="chat-box"></div>
 
         <div class="input-panel">
-            <input type="text" id="msg-input" class="input-field" placeholder="" autocomplete="off" maxlength="100">
-            <button id="send-button" class="send-btn" onclick="sendMessage()">#</button>
+            <input type="text" id="msg-input" class="input-field" placeholder="max 100 characters..." autocomplete="off" maxlength="100">
+            <button id="send-button" class="send-btn" onclick="sendMessage()">send</button>
         </div>
     </div>
 
@@ -86,7 +86,11 @@
         let isCooldown = false;
 
         function appendMessage(msg) {
+            // Проверка на дубликаты (чтобы одно и то же сообщение не прыгало дважды при лагах сети)
+            if (document.getElementById(`msg-${msg.id}`)) return;
+
             const msgElement = document.createElement('div');
+            msgElement.id = `msg-${msg.id}`;
             msgElement.className = 'message';
             msgElement.innerHTML = `
                 <img src="${avatarUrl}" class="avatar" alt="anon">
@@ -117,8 +121,9 @@
                     body: JSON.stringify({ text })
                 });
                 
+                // Если сервер ответил, что мы флудим
                 if (res.status === 429) {
-                    alert('too fast! wait 2 seconds.');
+                    console.log('cooldown on server active');
                 }
             } catch (e) {
                 console.log('send error');
@@ -162,6 +167,7 @@
                         });
                     }
                 } catch (e) {
+                    // Если сервер ушел в перезагрузку, ждем 2 секунды и пробуем снова
                     await new Promise(r => setTimeout(r, 2000));
                 }
             }
