@@ -7,23 +7,37 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
-        html, body { 
-            height: 100%; 
-            overflow: hidden;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-        }
-        
         body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: #ffffff;
+            height: 100vh;
             display: flex;
             flex-direction: column;
-            height: 100%;
+            overflow: hidden;
         }
+        
+        .chat-header {
+            padding: 8px 12px;
+            background: white;
+            border-bottom: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: flex-end;
+            flex-shrink: 0;
+        }
+        
+        .username-btn {
+            background: #000;
+            color: white;
+            border: none;
+            padding: 4px 12px;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 0;
+            clip-path: polygon(0% 0%, 100% 0%, 90% 100%, 0% 100%);
+        }
+        
+        .username-btn:active { background: #333; }
         
         .chat-area { 
             flex: 1; 
@@ -32,8 +46,6 @@
             display: flex; 
             flex-direction: column; 
             gap: 10px;
-            -webkit-overflow-scrolling: touch;
-            min-height: 0;
         }
         
         .message { 
@@ -51,8 +63,9 @@
             flex-shrink: 0;
         }
         
-        .msg-body { flex: 1; min-width: 0; }
+        .msg-body { flex: 1; }
         .msg-header { font-size: 12px; font-weight: bold; margin-bottom: 2px; }
+        .msg-name { color: #000; }
         .msg-time { font-size: 10px; color: #888; font-weight: normal; margin-left: 6px; }
         .msg-text { font-size: 13px; word-break: break-word; line-height: 1.3; color: #333; }
         
@@ -84,12 +97,10 @@
             color: white; 
             border: none; 
             border-radius: 18px;
-            font-weight: bold;
             cursor: pointer;
-            font-size: 14px;
         }
         
-        .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .send-btn:disabled { opacity: 0.5; }
         
         .toast {
             position: fixed;
@@ -102,10 +113,9 @@
             border-radius: 16px;
             font-size: 12px;
             z-index: 1000;
-            white-space: nowrap;
         }
         
-        .report-modal {
+        .report-modal, .username-modal {
             position: fixed;
             top: 0;
             left: 0;
@@ -118,9 +128,9 @@
             z-index: 2000;
         }
         
-        .report-modal.show { display: flex; }
+        .report-modal.show, .username-modal.show { display: flex; }
         
-        .report-content {
+        .report-content, .username-content {
             background: white;
             padding: 16px;
             border-radius: 12px;
@@ -128,34 +138,29 @@
             text-align: center;
         }
         
-        .report-content h4 { font-size: 16px; margin-bottom: 10px; }
-        .report-content textarea {
+        .report-content textarea, .username-content input {
             width: 100%;
-            height: 70px;
             margin: 10px 0;
             padding: 8px;
             border: 1px solid #ddd;
             border-radius: 8px;
-            resize: none;
-            font-family: inherit;
-            font-size: 13px;
         }
         
-        .report-content button {
-            padding: 6px 14px;
-            margin: 0 4px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 13px;
-        }
+        .report-content textarea { height: 70px; }
+        .username-content input { height: 36px; }
         
-        .report-submit { background: #ff4444; color: white; }
-        .report-cancel { background: #ddd; }
+        .report-submit, .username-save { background: #000; color: white; padding: 6px 14px; border: none; border-radius: 8px; cursor: pointer; }
+        .report-cancel, .username-cancel { background: #ddd; padding: 6px 14px; border: none; border-radius: 8px; cursor: pointer; }
+        .report-submit { background: #ff4444; }
     </style>
 </head>
 <body>
+    <div class="chat-header">
+        <button class="username-btn" id="username-btn">USERNAME</button>
+    </div>
+    
     <div class="chat-area" id="chat-box"></div>
+    
     <div class="input-panel">
         <input type="text" id="msg-input" class="input-field" placeholder="" maxlength="100" autocomplete="off">
         <button id="send-button" class="send-btn">#</button>
@@ -168,6 +173,17 @@
             <div>
                 <button class="report-submit" id="report-submit">OK</button>
                 <button class="report-cancel" id="report-cancel">X</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="username-modal" class="username-modal">
+        <div class="username-content">
+            <h4>Set username</h4>
+            <input type="text" id="username-input" placeholder="Username..." maxlength="10" autocomplete="off">
+            <div>
+                <button class="username-save" id="username-save">Save</button>
+                <button class="username-cancel" id="username-cancel">Cancel</button>
             </div>
         </div>
     </div>
@@ -184,6 +200,34 @@
         let pendingReportId = null;
         let clickCount = 0;
         let clickTimer = null;
+        let myUsername = '';
+        
+        async function loadUsername() {
+            try {
+                const res = await fetch(`${endpoint}/username`);
+                const data = await res.json();
+                myUsername = data.username || '';
+            } catch(e) {}
+        }
+        
+        async function saveUsernameToServer(username) {
+            try {
+                const res = await fetch(`${endpoint}/username`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+                if (res.status === 409) {
+                    showToast('Username already taken', true);
+                    return false;
+                }
+                const data = await res.json();
+                myUsername = data.username || '';
+                return true;
+            } catch(e) {
+                return false;
+            }
+        }
         
         function showToast(msg, isError = false) {
             let toast = document.querySelector('.toast');
@@ -198,19 +242,22 @@
         
         function appendMessage(msg) {
             if (document.getElementById(`msg-${msg.id}`)) return;
-            
             const msgElement = document.createElement('div');
             msgElement.id = `msg-${msg.id}`;
             msgElement.className = 'message';
+            const displayName = msg.username ? escapeHTML(msg.username) : 'anon';
             msgElement.innerHTML = `
                 <img src="${avatarUrl}" class="avatar" data-id="${msg.id}" alt="anon">
                 <div class="msg-body">
-                    <div class="msg-header">anon<span class="msg-time">${escapeHTML(msg.timestamp)}</span></div>
+                    <div class="msg-header">
+                        <span class="msg-name">${displayName}</span>
+                        <span class="msg-time">${escapeHTML(msg.timestamp)}</span>
+                    </div>
                     <div class="msg-text">${escapeHTML(msg.text)}</div>
                 </div>
             `;
             chatBox.appendChild(msgElement);
-            setTimeout(() => { chatBox.scrollTop = chatBox.scrollHeight; }, 50);
+            chatBox.scrollTop = chatBox.scrollHeight;
         }
         
         function escapeHTML(str) {
@@ -223,10 +270,8 @@
                 if (!avatar) return;
                 const msgId = avatar.getAttribute('data-id');
                 if (!msgId) return;
-                
                 clickCount++;
                 clearTimeout(clickTimer);
-                
                 if (clickCount >= 3) {
                     clickCount = 0;
                     openReportModal(msgId);
@@ -245,11 +290,7 @@
         async function submitReport() {
             if (!pendingReportId) return;
             const reason = document.getElementById('report-reason').value.trim();
-            if (!reason) {
-                showToast('Enter reason', true);
-                return;
-            }
-            
+            if (!reason) { showToast('Enter reason', true); return; }
             try {
                 const res = await fetch(`${endpoint}/report`, {
                     method: 'POST',
@@ -257,22 +298,12 @@
                     body: JSON.stringify({ targetId: pendingReportId, reason })
                 });
                 const data = await res.json();
-                
-                if (data.cleared) {
-                    showToast('Chat cleared');
-                    lastMessageId = -1;
-                    chatBox.innerHTML = '';
-                } else if (data.banned) {
-                    showToast('User banned');
-                } else if (data.unbanned) {
-                    showToast('User unbanned');
-                } else {
-                    showToast('Report sent');
-                }
+                if (data.cleared) { showToast('Chat cleared'); lastMessageId = -1; chatBox.innerHTML = ''; }
+                else if (data.banned) showToast('User banned');
+                else if (data.unbanned) showToast('User unbanned');
+                else showToast('Report sent');
                 closeReportModal();
-            } catch(e) {
-                showToast('Error', true);
-            }
+            } catch(e) { showToast('Error', true); }
         }
         
         function closeReportModal() {
@@ -280,21 +311,52 @@
             pendingReportId = null;
         }
         
+        function openUsernameModal() {
+            document.getElementById('username-modal').classList.add('show');
+            document.getElementById('username-input').value = myUsername;
+        }
+        
+        function closeUsernameModal() {
+            document.getElementById('username-modal').classList.remove('show');
+        }
+        
+        async function saveUsername() {
+            const newUsername = document.getElementById('username-input').value.trim();
+            if (newUsername.length > 10) {
+                showToast('Max 10 chars', true);
+                return;
+            }
+            const success = await saveUsernameToServer(newUsername);
+            if (success) {
+                if (myUsername) {
+                    showToast(`Username: ${myUsername}`);
+                } else {
+                    showToast('Username cleared');
+                }
+                closeUsernameModal();
+            }
+        }
+        
         async function sendMessage() {
             const text = msgInput.value.trim();
             if (!text || text.length > 100 || isCooldown) return;
-            
             msgInput.value = '';
             startCooldown();
-            
             try {
                 const res = await fetch(`${endpoint}/send`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text })
+                    body: JSON.stringify({ text, username: myUsername })
                 });
-                if (res.status === 429) showToast(await res.text(), true);
-                if (res.status === 403) showToast('Banned', true);
+                if (res.status === 429) {
+                    const msg = await res.text();
+                    showToast(msg, true);
+                }
+                if (res.status === 403) {
+                    const msg = await res.text();
+                    showToast(msg, true);
+                    setTimeout(() => location.reload(), 3000);
+                }
             } catch(e) {}
         }
         
@@ -302,15 +364,12 @@
             isCooldown = true;
             sendButton.disabled = true;
             msgInput.disabled = true;
-            
             let secondsLeft = 2;
             msgInput.placeholder = `${secondsLeft}s...`;
-            
             const interval = setInterval(() => {
                 secondsLeft--;
-                if (secondsLeft > 0) {
-                    msgInput.placeholder = `${secondsLeft}s...`;
-                } else {
+                if (secondsLeft > 0) msgInput.placeholder = `${secondsLeft}s...`;
+                else {
                     clearInterval(interval);
                     isCooldown = false;
                     sendButton.disabled = false;
@@ -327,29 +386,22 @@
                     const res = await fetch(`${endpoint}/messages?lastId=${lastMessageId}`);
                     if (res.status === 200) {
                         const msgs = await res.json();
-                        if (msgs.clear) {
-                            lastMessageId = -1;
-                            chatBox.innerHTML = '';
-                        } else {
-                            msgs.forEach(msg => {
-                                appendMessage(msg);
-                                if (msg.id > lastMessageId) lastMessageId = msg.id;
-                            });
-                        }
+                        if (msgs.clear) { lastMessageId = -1; chatBox.innerHTML = ''; }
+                        else { msgs.forEach(msg => { appendMessage(msg); if (msg.id > lastMessageId) lastMessageId = msg.id; }); }
                     }
-                } catch(e) {
-                    await new Promise(r => setTimeout(r, 2000));
-                }
+                } catch(e) { await new Promise(r => setTimeout(r, 2000)); }
             }
         }
         
-        msgInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !isCooldown) sendMessage();
-        });
+        msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !isCooldown) sendMessage(); });
         sendButton.addEventListener('click', sendMessage);
         document.getElementById('report-submit').addEventListener('click', submitReport);
         document.getElementById('report-cancel').addEventListener('click', closeReportModal);
+        document.getElementById('username-btn').addEventListener('click', openUsernameModal);
+        document.getElementById('username-save').addEventListener('click', saveUsername);
+        document.getElementById('username-cancel').addEventListener('click', closeUsernameModal);
         
+        await loadUsername();
         setupReportSystem();
         listenForMessages();
     </script>
