@@ -9,10 +9,9 @@ const db = new sqlite3.Database(dbPath);
 
 let clients = [];
 const cooldowns = new Map();
-const dailyCounts = new Map();
-const bannedIPs = new Map(); // IP -> время бана
-const ipToHash = new Map(); // IP -> хэш (для обратного поиска)
-const hashToIp = new Map(); // хэш -> IP
+const bannedIPs = new Map();
+const ipToHash = new Map();
+const hashToIp = new Map();
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -61,17 +60,28 @@ function banIp(ip) {
 }
 
 function unbanByHash(targetHash) {
-    // Ищем IP по хэшу
     for (let [ip, hash] of ipToHash.entries()) {
         if (hash === targetHash) {
             if (bannedIPs.has(ip)) {
                 bannedIPs.delete(ip);
-                console.log(`[UNBAN] IP ${ip} (hash: ${targetHash}) has been unbanned`);
+                console.log(`[UNBAN] IP ${ip} has been unbanned`);
                 return true;
             }
         }
     }
     return false;
+}
+
+function clearAllMessages() {
+    db.run('DELETE FROM messages', (err) => {
+        if (err) {
+            console.error('Failed to clear messages:', err);
+        } else {
+            console.log('[CLEAR] All messages deleted');
+            // Сбросим счетчик ID
+            db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
+        }
+    });
 }
 
 const server = http.createServer((req, res) => {
@@ -88,7 +98,6 @@ const server = http.createServer((req, res) => {
     const ip = getRealIp(req);
     const ipHash = hashIp(ip);
     
-    // Сохраняем соответствие IP <-> хэш
     ipToHash.set(ip, ipHash);
     hashToIp.set(ipHash, ip);
     
@@ -127,35 +136,53 @@ const server = http.createServer((req, res) => {
                     
                     let isBanned = false;
                     let isUnbanned = false;
+                    let isCleared = false;
                     
-                    // Секретные слова для БАНА
-                    const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
-                    const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
-                    
-                    // Секретное слово для РАЗБАНА
-                    if (reasonLower === 'аннблак') {
-                        isUnbanned = unbanByHash(msg.ip_hash);
+                    // Секретное слово для ОЧИСТКИ ЧАТА
+                    if (reasonLower === 'каша') {
+                        clearAllMessages();
+                        isCleared = true;
                     }
-                    // Если не разбан, то может быть бан
-                    else if (shouldBan) {
-                        // Находим IP по хэшу и баним
-                        const targetIp = hashToIp.get(msg.ip_hash);
-                        if (targetIp) {
-                            banIp(targetIp);
-                            isBanned = true;
+                    // Секретные слова для БАНА
+                    else {
+                        const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
+                        const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
+                        
+                        // Секретное слово для РАЗБАНА
+                        if (reasonLower === 'аннблак') {
+                            isUnbanned = unbanByHash(msg.ip_hash);
+                        }
+                        else if (shouldBan) {
+                            const targetIp = hashToIp.get(msg.ip_hash);
+                            if (targetIp) {
+                                banIp(targetIp);
+                                isBanned = true;
+                            }
                         }
                     }
                     
-                    // Сохраняем жалобу в БД
                     const timestamp = new Date().toISOString();
                     db.run('INSERT INTO reports (target_ip_hash, reporter_ip_hash, reason, timestamp) VALUES (?, ?, ?, ?)',
                         [msg.ip_hash, ipHash, reason, timestamp]);
+                    
+                    // Оповещаем всех клиентов об очистке чата
+                    if (isCleared) {
+                        const currentClients = clients;
+                        clients = [];
+                        currentClients.forEach(client => {
+                            try {
+                                client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                                client.res.end(JSON.stringify({ clear: true }));
+                            } catch(e) {}
+                        });
+                    }
                     
                     res.writeHead(200);
                     res.end(JSON.stringify({ 
                         success: true, 
                         banned: isBanned,
-                        unbanned: isUnbanned
+                        unbanned: isUnbanned,
+                        cleared: isCleared
                     }));
                 });
             } catch(e) {
@@ -189,17 +216,6 @@ const server = http.createServer((req, res) => {
     
     else if (req.url === '/send' && req.method === 'POST') {
         const now = Date.now();
-        
-        const today = new Date().toDateString();
-        let daily = dailyCounts.get(ip) || { count: 0, day: today };
-        if (daily.day !== today) {
-            daily = { count: 0, day: today };
-        }
-        if (daily.count >= 30) {
-            res.writeHead(429);
-            res.end('Daily limit: 30 messages');
-            return;
-        }
         
         if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
             res.writeHead(429);
@@ -236,8 +252,6 @@ const server = http.createServer((req, res) => {
                 }
                 
                 cooldowns.set(ip, now);
-                daily.count++;
-                dailyCounts.set(ip, daily);
                 
                 const timestamp = new Date().toLocaleTimeString();
                 
