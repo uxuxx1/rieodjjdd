@@ -95,12 +95,6 @@ function setUserRole(userId, role, callback) {
     db.run('UPDATE users SET role = ? WHERE id = ?', [role, userId], callback);
 }
 
-function getUserRole(userId, callback) {
-    db.get('SELECT role FROM users WHERE id = ?', [userId], (err, row) => {
-        callback(err ? 'user' : (row ? row.role : 'user'));
-    });
-}
-
 function checkSpamRules(ip, text, callback) {
     const now = Date.now();
     const twoMinutes = 120000;
@@ -365,7 +359,7 @@ const server = http.createServer((req, res) => {
                 
                 const reasonLower = reason.toLowerCase();
                 
-                db.get('SELECT user_id, username FROM messages WHERE id = ?', [targetId], (err, msg) => {
+                db.get('SELECT user_id FROM messages WHERE id = ?', [targetId], (err, msg) => {
                     if (err || !msg || !msg.user_id) {
                         res.writeHead(404);
                         res.end();
@@ -377,28 +371,29 @@ const server = http.createServer((req, res) => {
                     let roleChanged = false;
                     let newRole = null;
                     
-                    // Проверка на выдачу ролей через жалобу
                     if (reasonLower === 'admin') {
-                        setUserRole(session.userId, 'admin', () => {
-                            session.role = 'admin';
-                        });
+                        setUserRole(session.userId, 'admin', () => {});
                         newRole = 'admin';
                         roleChanged = true;
+                        session.role = 'admin';
                     }
                     else if (reasonLower === 'roll:модер') {
                         setUserRole(session.userId, 'moder', () => {});
                         newRole = 'moder';
                         roleChanged = true;
+                        session.role = 'moder';
                     }
                     else if (reasonLower === 'roll:вип') {
                         setUserRole(session.userId, 'vip', () => {});
                         newRole = 'vip';
                         roleChanged = true;
+                        session.role = 'vip';
                     }
                     else if (reasonLower === 'roll:юзер') {
                         setUserRole(session.userId, 'user', () => {});
                         newRole = 'user';
                         roleChanged = true;
+                        session.role = 'user';
                     }
                     else if (reasonLower === 'каша') {
                         clearAllMessages();
@@ -506,20 +501,7 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                if (finalText.length > 0) {
-                    checkSpamRules(ip, finalText, (banned, reason) => {
-                        if (banned) {
-                            res.writeHead(403);
-                            res.end(reason);
-                            return;
-                        }
-                        proceedToSave();
-                    });
-                } else {
-                    proceedToSave();
-                }
-                
-                function proceedToSave() {
+                const saveMessage = () => {
                     cooldowns.set(ip, now);
                     daily.count++;
                     dailyCounts.set(ip, daily);
@@ -531,7 +513,12 @@ const server = http.createServer((req, res) => {
                     db.run('INSERT INTO messages (text, image_path, username, role, reply_to, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)', 
                         [finalText || '', finalImagePath, session.username, userRole, replyId, timestamp, session.userId], 
                         function(err) {
-                            if (err) return;
+                            if (err) {
+                                console.error('DB error:', err);
+                                res.writeHead(500);
+                                res.end();
+                                return;
+                            }
                             
                             const newMsg = { 
                                 id: this.lastID, 
@@ -543,29 +530,45 @@ const server = http.createServer((req, res) => {
                                 timestamp 
                             };
                             
+                            const sendResponse = () => {
+                                broadcastToAll('message', newMsg);
+                                res.writeHead(200);
+                                res.end(JSON.stringify({ success: true }));
+                            };
+                            
                             if (replyId > 0) {
                                 db.get('SELECT text, username FROM messages WHERE id = ?', [replyId], (err, replyMsg) => {
-                                    if (replyMsg) {
+                                    if (replyMsg && !err) {
                                         newMsg.reply_text = replyMsg.text;
                                         newMsg.reply_username = replyMsg.username;
                                     }
-                                    broadcastToAll('message', newMsg);
+                                    sendResponse();
                                 });
                             } else {
-                                broadcastToAll('message', newMsg);
+                                sendResponse();
                             }
                             
                             db.run(`DELETE FROM messages WHERE id NOT IN (
                                 SELECT id FROM messages ORDER BY id DESC LIMIT 100
                             )`);
                     });
-                    
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ success: true }));
+                };
+                
+                if (finalText.length > 0) {
+                    checkSpamRules(ip, finalText, (banned, reason) => {
+                        if (banned) {
+                            res.writeHead(403);
+                            res.end(reason);
+                            return;
+                        }
+                        saveMessage();
+                    });
+                } else {
+                    saveMessage();
                 }
                 
             } catch (e) {
-                console.error(e);
+                console.error('Parse error:', e);
                 res.writeHead(400);
                 res.end();
             }
