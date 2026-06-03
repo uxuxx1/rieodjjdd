@@ -18,13 +18,12 @@
         }
 
         body {
-            font-family: system-ui, -apple-system, sans-serif;
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: #1a1a1a;
             color: #fff;
             display: flex;
             flex-direction: column;
             height: 100%;
-            transition: background 0.3s, color 0.3s;
         }
 
         body.light {
@@ -89,9 +88,14 @@
             color: #fff;
         }
 
+        body.light .online-count {
+            color: #000;
+        }
+
         .top-bar {
             display: flex;
             justify-content: space-between;
+            align-items: center;
             padding: 6px 12px;
             background: #1a1a1a;
             border-bottom: 1px solid #333;
@@ -100,15 +104,17 @@
 
         .top-bar-left {
             display: flex;
-            gap: 8px;
+            align-items: center;
+            gap: 12px;
         }
 
         .top-bar-right {
             display: flex;
+            align-items: center;
             gap: 8px;
         }
 
-        .auth-btn, .theme-btn {
+        .theme-btn, .auth-btn {
             background: #000;
             color: white;
             border: none;
@@ -121,6 +127,14 @@
 
         .logout-btn {
             background: #333;
+        }
+
+        .online-count {
+            font-size: 11px;
+            font-weight: normal;
+            color: #fff;
+            background: transparent;
+            padding: 4px 8px;
         }
 
         .chat-area {
@@ -143,6 +157,10 @@
             border-bottom: 1px solid #2a2a2a;
         }
 
+        body.light .message {
+            border-bottom: 1px solid #e0e0e0;
+        }
+
         .reply-indicator {
             font-size: 11px;
             color: #aaa;
@@ -161,6 +179,10 @@
             display: inline-block;
         }
 
+        body.light .reply-indicator span {
+            background: #f0f0f0;
+        }
+
         .avatar {
             width: 32px;
             height: 32px;
@@ -168,6 +190,10 @@
             background: #333;
             flex-shrink: 0;
             cursor: pointer;
+        }
+
+        body.light .avatar {
+            background: #eee;
         }
 
         .msg-body {
@@ -185,6 +211,10 @@
             cursor: pointer;
         }
 
+        body.light .msg-name {
+            color: #000;
+        }
+
         .msg-time {
             font-size: 10px;
             color: #666;
@@ -192,11 +222,19 @@
             margin-left: 6px;
         }
 
+        body.light .msg-time {
+            color: #888;
+        }
+
         .msg-text {
             font-size: 13px;
             word-break: break-word;
             color: #ddd;
             line-height: 1.3;
+        }
+
+        body.light .msg-text {
+            color: #222;
         }
         
         .msg-image {
@@ -221,6 +259,10 @@
             background: #333;
         }
 
+        body.light .reply-btn:hover {
+            background: #f0f0f0;
+        }
+
         .input-panel {
             display: flex;
             gap: 8px;
@@ -228,6 +270,11 @@
             background: #1a1a1a;
             border-top: 1px solid #333;
             flex-shrink: 0;
+        }
+
+        body.light .input-panel {
+            background: #fff;
+            border-top: 1px solid #ddd;
         }
 
         .input-field {
@@ -242,13 +289,27 @@
             color: #fff;
         }
 
+        body.light .input-field {
+            background: #fff;
+            border-color: #ccc;
+            color: #000;
+        }
+
         .input-field:focus {
             border-color: #666;
+        }
+
+        body.light .input-field:focus {
+            border-color: #000;
         }
 
         .input-field:disabled {
             background: #2a2a2a;
             opacity: 0.7;
+        }
+
+        body.light .input-field:disabled {
+            background: #f5f5f5;
         }
 
         .send-btn, .photo-btn {
@@ -295,6 +356,10 @@
             text-align: center;
         }
 
+        body.light .modal-content {
+            background: #fff;
+        }
+
         .modal-content input {
             width: 100%;
             margin: 10px 0;
@@ -304,6 +369,12 @@
             font-size: 14px;
             background: #1a1a1a;
             color: #fff;
+        }
+
+        body.light .modal-content input {
+            background: #fff;
+            border-color: #ccc;
+            color: #000;
         }
 
         .modal-content textarea {
@@ -317,6 +388,12 @@
             color: #fff;
             resize: none;
             height: 70px;
+        }
+
+        body.light .modal-content textarea {
+            background: #fff;
+            border-color: #ccc;
+            color: #000;
         }
 
         .modal-content button {
@@ -380,6 +457,7 @@
 <div class="top-bar">
     <div class="top-bar-left">
         <button class="theme-btn" id="themeBtn">theme</button>
+        <div class="online-count" id="onlineCount">online: --</div>
     </div>
     <div class="top-bar-right" id="authButtons">
         <button class="auth-btn" id="loginBtn">login</button>
@@ -444,6 +522,7 @@
         const photoInput = document.getElementById('photoInput');
         const authButtons = document.getElementById('authButtons');
         const warningBanner = document.getElementById('warningBanner');
+        const onlineCountSpan = document.getElementById('onlineCount');
         const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
 
         let lastId = -1;
@@ -454,6 +533,8 @@
         let myToken = localStorage.getItem('chatToken');
         let myUsername = '';
         let replyToMsg = null;
+        let ws = null;
+        let wsReconnectTimer = null;
 
         let isDark = localStorage.getItem('theme') !== 'light';
         function applyTheme() {
@@ -479,6 +560,44 @@
         function escapeHtml(str) {
             if (!str) return '';
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function updateOnlineCount(count) {
+            onlineCountSpan.textContent = 'online: ' + count;
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.host + '/ws';
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+            };
+            
+            ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'online') {
+                        updateOnlineCount(data.count);
+                    } else if (data.type === 'message') {
+                        appendMessage(data.data);
+                        if (data.data.id > lastId) lastId = data.data.id;
+                    }
+                } catch(e) {}
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected, reconnecting...');
+                if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = setTimeout(connectWebSocket, 3000);
+            };
+            
+            ws.onerror = function() {
+                ws.close();
+            };
         }
 
         function updateAuthUI() {
@@ -619,7 +738,7 @@
             if (msg.reply_to && msg.reply_to > 0) {
                 const replyPreview = msg.reply_text ? (msg.reply_text.length > 50 ? msg.reply_text.substring(0, 50) + '...' : msg.reply_text) : '';
                 const replyName = msg.reply_username ? escapeHtml(msg.reply_username) : 'anon';
-                replyHtml = '<div class="reply-indicator"><span>↳ reply to ' + replyName + ': ' + escapeHtml(replyPreview) + '</span></div>';
+                replyHtml = '<div class="reply-indicator"><span>reply to ' + replyName + ': ' + escapeHtml(replyPreview) + '</span></div>';
             }
             
             const div = document.createElement('div');
@@ -834,26 +953,17 @@
             reader.readAsDataURL(file);
         }
 
-        async function pollMessages() {
-            while (true) {
-                try {
-                    const res = await fetch(endpoint + '/messages?lastId=' + lastId);
-                    if (res.status === 200) {
-                        const list = await res.json();
-                        if (list.clear) {
-                            lastId = -1;
-                            chatBox.innerHTML = '';
-                        } else {
-                            for (let m of list) {
-                                appendMessage(m);
-                                if (m.id > lastId) lastId = m.id;
-                            }
-                        }
+        async function loadHistory() {
+            try {
+                const res = await fetch(endpoint + '/messages?lastId=0');
+                if (res.status === 200) {
+                    const list = await res.json();
+                    for (let m of list) {
+                        appendMessage(m);
+                        if (m.id > lastId) lastId = m.id;
                     }
-                } catch(e) {
-                    await new Promise(r => setTimeout(r, 2000));
                 }
-            }
+            } catch(e) {}
         }
 
         function closeModals() {
@@ -916,7 +1026,8 @@
         (async function init() {
             await verifyToken();
             updateAuthUI();
-            pollMessages();
+            connectWebSocket();
+            await loadHistory();
         })();
     })();
 </script>
