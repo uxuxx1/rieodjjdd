@@ -23,18 +23,66 @@
             display: flex;
             flex-direction: column;
             height: 100%;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        body.dark {
+            background: #1a1a1a;
+            color: #fff;
+        }
+
+        body.dark .top-bar,
+        body.dark .input-panel {
+            background: #1a1a1a;
+            border-color: #333;
+        }
+
+        body.dark .input-field {
+            background: #2a2a2a;
+            border-color: #444;
+            color: #fff;
+        }
+
+        body.dark .msg-text {
+            color: #ddd;
+        }
+
+        body.dark .msg-time {
+            color: #666;
+        }
+
+        body.dark .modal-content {
+            background: #2a2a2a;
+            color: #fff;
+        }
+
+        body.dark .modal-content input,
+        body.dark .modal-content textarea {
+            background: #1a1a1a;
+            border-color: #444;
+            color: #fff;
         }
 
         .top-bar {
             display: flex;
-            justify-content: flex-end;
+            justify-content: space-between;
             padding: 6px 12px;
             background: #fff;
             border-bottom: 1px solid #ddd;
             flex-shrink: 0;
         }
 
-        .username-btn {
+        .top-bar-left {
+            display: flex;
+            gap: 8px;
+        }
+
+        .top-bar-right {
+            display: flex;
+            gap: 8px;
+        }
+
+        .username-btn, .theme-btn {
             background: #000;
             color: white;
             border: none;
@@ -43,6 +91,10 @@
             font-weight: bold;
             cursor: pointer;
             clip-path: polygon(0% 0%, 100% 0%, 90% 100%, 0% 100%);
+        }
+
+        .theme-btn {
+            background: #000;
         }
 
         .chat-area {
@@ -70,6 +122,10 @@
             cursor: pointer;
         }
 
+        body.dark .avatar {
+            background: #333;
+        }
+
         .msg-body {
             flex: 1;
         }
@@ -82,6 +138,10 @@
 
         .msg-name {
             color: #000;
+        }
+
+        body.dark .msg-name {
+            color: #fff;
         }
 
         .msg-time {
@@ -216,12 +276,21 @@
             z-index: 1100;
             white-space: nowrap;
         }
+
+        body.dark .toast {
+            background: #555;
+        }
     </style>
 </head>
 <body>
 
 <div class="top-bar">
-    <button class="username-btn" id="usernameBtn">USERNAME</button>
+    <div class="top-bar-left">
+        <button class="theme-btn" id="themeBtn">theme</button>
+    </div>
+    <div class="top-bar-right">
+        <button class="username-btn" id="usernameBtn">USERNAME</button>
+    </div>
 </div>
 
 <div class="chat-area" id="chatBox"></div>
@@ -272,6 +341,17 @@
         let clickCount = 0;
         let clickTimer = null;
         let myUsername = '';
+
+        // Тема
+        let isDark = localStorage.getItem('theme') === 'dark';
+        function applyTheme() {
+            if (isDark) {
+                document.body.classList.add('dark');
+            } else {
+                document.body.classList.remove('dark');
+            }
+        }
+        applyTheme();
 
         function showToast(msg, isErr = false) {
             let t = document.querySelector('.toast');
@@ -421,13 +501,11 @@
         }
 
         async function sendMessage(text) {
-            const formData = new FormData();
-            formData.append('text', text);
-            
             try {
                 const res = await fetch(`${endpoint}/send`, {
                     method: 'POST',
-                    body: formData
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
                 });
                 if(res.status === 429) {
                     const txt = await res.text();
@@ -448,9 +526,7 @@
 
         async function handleSendMessage() {
             const text = msgInput.value.trim();
-            if((!text || text.length > 100) && isCooldown) return;
-            if(isCooldown) return;
-            
+            if(!text || text.length > 100 || isCooldown) return;
             msgInput.value = '';
             startCooldown();
             const success = await sendMessage(text);
@@ -539,6 +615,12 @@
             }
         }
 
+        function toggleTheme() {
+            isDark = !isDark;
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+            applyTheme();
+        }
+
         sendBtn.addEventListener('click', handleSendMessage);
         photoBtn.addEventListener('click', () => photoInput.click());
         photoInput.addEventListener('change', handlePhotoUpload);
@@ -555,6 +637,7 @@
             document.getElementById('reportModal').classList.remove('show');
             pendingReportId = null;
         });
+        document.getElementById('themeBtn').addEventListener('click', toggleTheme);
 
         setupReports();
         loadUsername().then(() => {
