@@ -628,7 +628,8 @@
         function updateAuthUI() {
             if (myToken && myUsername) {
                 authButtons.innerHTML = '<span style="color:#fff; font-size:11px; margin-right:8px;">' + escapeHtml(myUsername) + getRoleBadge(myRole) + '</span><button class="auth-btn logout-btn" id="logoutBtn">logout</button>';
-                document.getElementById('logoutBtn').addEventListener('click', logout);
+                const logoutBtn = document.getElementById('logoutBtn');
+                if (logoutBtn) logoutBtn.addEventListener('click', logout);
                 msgInput.disabled = false;
                 photoBtn.disabled = false;
                 sendBtn.disabled = false;
@@ -641,8 +642,10 @@
                 }
             } else {
                 authButtons.innerHTML = '<button class="auth-btn" id="loginBtn">login</button><button class="auth-btn" id="registerBtn">register</button>';
-                document.getElementById('loginBtn').addEventListener('click', () => openModal('login'));
-                document.getElementById('registerBtn').addEventListener('click', () => openModal('register'));
+                const loginBtn = document.getElementById('loginBtn');
+                const registerBtn = document.getElementById('registerBtn');
+                if (loginBtn) loginBtn.addEventListener('click', () => openModal('login'));
+                if (registerBtn) registerBtn.addEventListener('click', () => openModal('register'));
                 msgInput.disabled = true;
                 photoBtn.disabled = true;
                 sendBtn.disabled = true;
@@ -1073,4 +1076,4 @@
     })();
 </script>
 </body>
-        </html>
+    </html>
