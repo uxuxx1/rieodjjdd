@@ -6,23 +6,26 @@ const crypto = require('crypto');
 
 const dbPath = path.join(__dirname, 'chat.db');
 const db = new sqlite3.Database(dbPath);
+const uploadDir = path.join(__dirname, 'uploads');
+
+// Создаём папку для фото
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
 let clients = [];
 const cooldowns = new Map();
 const bannedIPs = new Map();
 const ipToHash = new Map();
 const hashToIp = new Map();
-
-// Для антиспам системы
-const messageHistory = new Map(); // ip -> [{text, timestamp}]
-const dailyCounts = new Map(); // ip -> {count, day}
-const consecutiveMessages = new Map(); // ip -> {count, lastText, lastTime}
-const uppercaseWarnings = new Map(); // ip -> uppercaseCount
+const dailyCounts = new Map();
+const messageHistory = new Map();
+const consecutiveMessages = new Map();
+const uppercaseWarnings = new Map();
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT NOT NULL,
+        text TEXT DEFAULT '',
+        image_path TEXT DEFAULT '',
         username TEXT DEFAULT '',
         timestamp TEXT NOT NULL,
         ip_hash TEXT NOT NULL
@@ -86,9 +89,14 @@ function unbanByHash(targetHash) {
 }
 
 function clearAllMessages() {
+    // Удаляем все файлы фото
+    const files = fs.readdirSync(uploadDir);
+    for (let file of files) {
+        fs.unlinkSync(path.join(uploadDir, file));
+    }
     db.run('DELETE FROM messages');
     db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
-    console.log('[CLEAR] All messages deleted');
+    console.log('[CLEAR] All messages and images deleted');
 }
 
 function getUsername(ipHash, callback) {
@@ -109,6 +117,24 @@ function isUsernameTaken(username, excludeHash, callback) {
     });
 }
 
+function parseMultipart(body, boundary) {
+    const parts = {};
+    const sections = body.split('--' + boundary);
+    for (let section of sections) {
+        if (section.includes('Content-Disposition')) {
+            const nameMatch = section.match(/name="([^"]+)"/);
+            if (nameMatch) {
+                const name = nameMatch[1];
+                const valueStart = section.indexOf('\r\n\r\n') + 4;
+                let value = section.slice(valueStart);
+                if (value.endsWith('\r\n')) value = value.slice(0, -2);
+                parts[name] = value;
+            }
+        }
+    }
+    return parts;
+}
+
 function checkSpamRules(ip, text, callback) {
     const now = Date.now();
     const twoMinutes = 120000;
@@ -117,24 +143,21 @@ function checkSpamRules(ip, text, callback) {
     const fiftyConsecutive = 50;
     const tenUppercase = 10;
     
-    // Получаем историю
     let history = messageHistory.get(ip) || [];
     history = history.filter(m => now - m.timestamp < twoMinutes);
     
-    // 1. 10 одинаковых сообщений за 2 минуты
     const sameIn2min = history.filter(m => m.text === text).length;
     if (sameIn2min + 1 >= tenSameMessages) {
-        banIp(ip, `10 identical messages in 2 minutes: "${text}"`);
+        banIp(ip, `10 identical messages in 2 minutes`);
         callback(true, '10 identical messages in 2 minutes - banned');
         return;
     }
     
-    // 2. 5 одинаковых сообщений подряд
     const consecutive = consecutiveMessages.get(ip) || { count: 0, lastText: '' };
-    if (consecutive.lastText === text) {
+    if (consecutive.lastText === text && text.length > 0) {
         consecutive.count++;
         if (consecutive.count >= fiveSameMessages) {
-            banIp(ip, `5 identical messages in a row: "${text}"`);
+            banIp(ip, `5 identical messages in a row`);
             callback(true, '5 identical messages in a row - banned');
             return;
         }
@@ -144,17 +167,14 @@ function checkSpamRules(ip, text, callback) {
     }
     consecutiveMessages.set(ip, consecutive);
     
-    // 3. 50 сообщений подряд без перебивания другими IP
-    // Считаем все последние сообщения в чате (нужно глобально, но упрощенно через историю)
     const globalHistory = messageHistory.get('global') || [];
     const last50FromSame = globalHistory.filter(m => m.ip === ip).slice(-50).length;
-    if (last50FromSame >= 50) {
+    if (last50FromSame >= fiftyConsecutive) {
         banIp(ip, `50 consecutive messages without interruption`);
         callback(true, '50 consecutive messages - banned');
         return;
     }
     
-    // 4. 10 сообщений подряд ЗАГЛАВНЫМИ буквами
     const isUppercase = text === text.toUpperCase() && text !== text.toLowerCase() && text.length > 3;
     let upperCount = uppercaseWarnings.get(ip) || 0;
     if (isUppercase) {
@@ -169,14 +189,12 @@ function checkSpamRules(ip, text, callback) {
     }
     uppercaseWarnings.set(ip, upperCount);
     
-    // Обновляем историю
     history.push({ text, timestamp: now });
     messageHistory.set(ip, history);
     
-    // Обновляем глобальную историю для правила 50 подряд
     let global = messageHistory.get('global') || [];
     global.push({ ip, timestamp: now });
-    global = global.filter(m => now - m.timestamp < 300000); // последние 5 минут
+    global = global.filter(m => now - m.timestamp < 300000);
     messageHistory.set('global', global);
     
     callback(false, 'ok');
@@ -324,7 +342,7 @@ const server = http.createServer((req, res) => {
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
 
-        db.all('SELECT id, text, username, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
+        db.all('SELECT id, text, image_path, username, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
@@ -341,57 +359,75 @@ const server = http.createServer((req, res) => {
     } 
     
     else if (req.url === '/send' && req.method === 'POST') {
-        const now = Date.now();
+        const contentType = req.headers['content-type'] || '';
+        const isMultipart = contentType.includes('multipart/form-data');
         
-        // Кулдаун 2 секунды
-        if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
-            res.writeHead(429);
-            res.end('Wait 2 seconds');
-            return;
-        }
-        
-        // Дневной лимит 1000 сообщений
-        const today = new Date().toDateString();
-        let daily = dailyCounts.get(ip) || { count: 0, day: today };
-        if (daily.day !== today) {
-            daily = { count: 0, day: today };
-        }
-        if (daily.count >= 1000) {
-            res.writeHead(429);
-            res.end('Daily limit: 1000 messages');
-            return;
-        }
-
-        let body = '';
-        req.on('data', chunk => { 
-            if (body.length > 1024) {
-                res.writeHead(413);
-                res.end();
-                req.destroy();
-                return;
-            }
-            body += chunk.toString(); 
-        });
-        
-        req.on('end', () => {
-            try {
-                const data = JSON.parse(body);
-                let text = data.text ? data.text.trim() : '';
-                let username = data.username ? data.username.trim().substring(0, 10) : '';
-                
-                if (text.length < 1 || text.length > 100) {
+        if (isMultipart) {
+            // Обработка фото
+            let body = [];
+            req.on('data', chunk => body.push(chunk));
+            req.on('end', () => {
+                const buffer = Buffer.concat(body);
+                const boundary = contentType.split('boundary=')[1];
+                if (!boundary) {
                     res.writeHead(400);
-                    res.end('1-100 chars');
+                    res.end();
                     return;
                 }
                 
-                if (/(.)\1{15,}/.test(text)) {
+                // Парсим multipart
+                let text = '';
+                let imageData = null;
+                
+                const parts = buffer.toString('binary').split('--' + boundary);
+                for (let part of parts) {
+                    if (part.includes('name="text"')) {
+                        const match = part.match(/\r\n\r\n(.*?)\r\n--/s);
+                        if (match) text = match[1].trim();
+                    }
+                    if (part.includes('name="image"')) {
+                        const headerEnd = part.indexOf('\r\n\r\n');
+                        if (headerEnd !== -1) {
+                            let dataStart = headerEnd + 4;
+                            let dataEnd = part.lastIndexOf('\r\n--');
+                            if (dataEnd === -1) dataEnd = part.length;
+                            imageData = part.slice(dataStart, dataEnd);
+                        }
+                    }
+                }
+                
+                const now = Date.now();
+                const today = new Date().toDateString();
+                let daily = dailyCounts.get(ip) || { count: 0, day: today };
+                if (daily.day !== today) daily = { count: 0, day: today };
+                if (daily.count >= 1000) {
+                    res.writeHead(429);
+                    res.end('Daily limit: 1000 messages');
+                    return;
+                }
+                
+                if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
+                    res.writeHead(429);
+                    res.end('Wait 2 seconds');
+                    return;
+                }
+                
+                // Сохраняем фото если есть
+                let imagePath = '';
+                if (imageData) {
+                    const ext = '.jpg';
+                    const filename = Date.now() + '_' + Math.random().toString(36).substr(2, 8) + ext;
+                    imagePath = '/uploads/' + filename;
+                    const fullPath = path.join(uploadDir, filename);
+                    fs.writeFileSync(fullPath, imageData, 'binary');
+                }
+                
+                if (text.length > 0 && (/(.)\1{15,}/.test(text))) {
                     res.writeHead(400);
                     res.end('No spam patterns');
                     return;
                 }
                 
-                // Проверка спам-правил
                 checkSpamRules(ip, text, (banned, reason) => {
                     if (banned) {
                         res.writeHead(403);
@@ -406,12 +442,12 @@ const server = http.createServer((req, res) => {
                     const timestamp = new Date().toLocaleTimeString();
                     
                     getUsername(ipHash, (finalUsername) => {
-                        db.run('INSERT INTO messages (text, username, timestamp, ip_hash) VALUES (?, ?, ?, ?)', 
-                            [text, finalUsername || username || '', timestamp, ipHash], 
+                        db.run('INSERT INTO messages (text, image_path, username, timestamp, ip_hash) VALUES (?, ?, ?, ?, ?)', 
+                            [text || '', imagePath, finalUsername || '', timestamp, ipHash], 
                             function(err) {
                                 if (err) return;
                                 
-                                const newMsg = { id: this.lastID, text, username: finalUsername || username || '', timestamp };
+                                const newMsg = { id: this.lastID, text: text || '', image_path: imagePath, username: finalUsername || '', timestamp };
                                 
                                 db.run(`DELETE FROM messages WHERE id NOT IN (
                                     SELECT id FROM messages ORDER BY id DESC LIMIT 100
@@ -429,13 +465,103 @@ const server = http.createServer((req, res) => {
                     res.writeHead(200);
                     res.end(JSON.stringify({ success: true }));
                 });
-                
-            } catch (e) {
-                res.writeHead(400);
+            });
+        } else {
+            // Обычный текст
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body);
+                    let text = data.text ? data.text.trim() : '';
+                    let username = data.username ? data.username.trim().substring(0, 10) : '';
+                    
+                    if (text.length < 1 || text.length > 100) {
+                        res.writeHead(400);
+                        res.end('1-100 chars');
+                        return;
+                    }
+                    
+                    if (/(.)\1{15,}/.test(text)) {
+                        res.writeHead(400);
+                        res.end('No spam patterns');
+                        return;
+                    }
+                    
+                    const now = Date.now();
+                    const today = new Date().toDateString();
+                    let daily = dailyCounts.get(ip) || { count: 0, day: today };
+                    if (daily.day !== today) daily = { count: 0, day: today };
+                    if (daily.count >= 1000) {
+                        res.writeHead(429);
+                        res.end('Daily limit: 1000 messages');
+                        return;
+                    }
+                    
+                    if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
+                        res.writeHead(429);
+                        res.end('Wait 2 seconds');
+                        return;
+                    }
+                    
+                    checkSpamRules(ip, text, (banned, reason) => {
+                        if (banned) {
+                            res.writeHead(403);
+                            res.end(reason);
+                            return;
+                        }
+                        
+                        cooldowns.set(ip, now);
+                        daily.count++;
+                        dailyCounts.set(ip, daily);
+                        
+                        const timestamp = new Date().toLocaleTimeString();
+                        
+                        getUsername(ipHash, (finalUsername) => {
+                            db.run('INSERT INTO messages (text, image_path, username, timestamp, ip_hash) VALUES (?, ?, ?, ?, ?)', 
+                                [text, '', finalUsername || username || '', timestamp, ipHash], 
+                                function(err) {
+                                    if (err) return;
+                                    
+                                    const newMsg = { id: this.lastID, text: text, image_path: '', username: finalUsername || username || '', timestamp };
+                                    
+                                    db.run(`DELETE FROM messages WHERE id NOT IN (
+                                        SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                                    )`);
+                                    
+                                    const currentClients = clients;
+                                    clients = [];
+                                    currentClients.forEach(client => {
+                                        client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                                        client.res.end(JSON.stringify([newMsg]));
+                                    });
+                            });
+                        });
+                        
+                        res.writeHead(200);
+                        res.end(JSON.stringify({ success: true }));
+                    });
+                } catch (e) {
+                    res.writeHead(400);
+                    res.end();
+                }
+            });
+        }
+    } 
+    
+    else if (req.url.startsWith('/uploads/') && req.method === 'GET') {
+        const filename = req.url.replace('/uploads/', '');
+        const filepath = path.join(uploadDir, filename);
+        fs.readFile(filepath, (err, data) => {
+            if (err) {
+                res.writeHead(404);
                 res.end();
+            } else {
+                res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+                res.end(data);
             }
         });
-    } 
+    }
     
     else {
         res.writeHead(404);
@@ -451,7 +577,6 @@ setInterval(() => {
     for (const [ip, time] of bannedIPs.entries()) {
         if (now - time > 3600000) bannedIPs.delete(ip);
     }
-    // Очистка истории сообщений
     for (const [ip, history] of messageHistory.entries()) {
         if (ip === 'global') continue;
         const filtered = history.filter(m => now - m.timestamp < 120000);
@@ -461,7 +586,6 @@ setInterval(() => {
             messageHistory.set(ip, filtered);
         }
     }
-    // Очистка глобальной истории
     if (messageHistory.has('global')) {
         const global = messageHistory.get('global').filter(m => now - m.timestamp < 300000);
         messageHistory.set('global', global);
