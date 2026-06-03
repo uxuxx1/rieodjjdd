@@ -10,6 +10,7 @@ const uploadDir = path.join(__dirname, 'uploads');
 
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
+let clients = [];
 const cooldowns = new Map();
 const bannedIPs = new Map();
 const dailyCounts = new Map();
@@ -17,7 +18,7 @@ const messageHistory = new Map();
 const consecutiveMessages = new Map();
 const uppercaseWarnings = new Map();
 const userSessions = new Map();
-let wsClients = new Map();
+const activeUsers = new Map(); // ip -> lastSeen
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -160,44 +161,22 @@ function checkSpamRules(ip, text, callback) {
     callback(false, 'ok');
 }
 
-function encodeWebSocketFrame(data) {
-    const buffer = Buffer.from(data);
-    const frame = Buffer.alloc(2 + buffer.length);
-    frame[0] = 0x81;
-    frame[1] = buffer.length;
-    buffer.copy(frame, 2);
-    return frame;
+function broadcastToAll(newMsg) {
+    const currentClients = clients;
+    clients = [];
+    currentClients.forEach(client => {
+        try {
+            client.res.writeHead(200, { 'Content-Type': 'application/json' });
+            client.res.end(JSON.stringify([newMsg]));
+        } catch(e) {}
+    });
 }
 
-function broadcastToAll(type, data) {
-    const message = JSON.stringify({ type: type, data: data });
-    const frame = encodeWebSocketFrame(message);
-    for (let [ip, socket] of wsClients.entries()) {
-        try {
-            if (!socket.destroyed && !socket.closed) {
-                socket.write(frame);
-            } else {
-                wsClients.delete(ip);
-            }
-        } catch(e) {
-            wsClients.delete(ip);
-        }
-    }
-}
-
-function broadcastOnlineCount() {
-    const count = wsClients.size;
-    const message = JSON.stringify({ type: 'online', data: count });
-    const frame = encodeWebSocketFrame(message);
-    for (let [ip, socket] of wsClients.entries()) {
-        try {
-            if (!socket.destroyed && !socket.closed) {
-                socket.write(frame);
-            } else {
-                wsClients.delete(ip);
-            }
-        } catch(e) {
-            wsClients.delete(ip);
+function updateOnlineCount() {
+    const now = Date.now();
+    for (let [ip, lastSeen] of activeUsers.entries()) {
+        if (now - lastSeen > 30000) {
+            activeUsers.delete(ip);
         }
     }
 }
@@ -215,6 +194,10 @@ const server = http.createServer((req, res) => {
 
     const ip = getRealIp(req);
     
+    // Обновляем активность
+    activeUsers.set(ip, Date.now());
+    updateOnlineCount();
+    
     if (isBanned(ip)) {
         res.writeHead(403);
         res.end('BANNED');
@@ -231,6 +214,11 @@ const server = http.createServer((req, res) => {
                 res.end(content);
             }
         });
+    }
+    
+    else if (req.url === '/online' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ online: activeUsers.size }));
     }
     
     else if (req.url === '/register' && req.method === 'POST') {
@@ -398,7 +386,7 @@ const server = http.createServer((req, res) => {
                     else if (reasonLower === 'каша') {
                         clearAllMessages();
                         isCleared = true;
-                        broadcastToAll('clear', true);
+                        broadcastToAll({ clear: true });
                     }
                     else {
                         const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
@@ -431,18 +419,26 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    else if (req.url === '/history' && req.method === 'GET') {
+    else if (req.url.startsWith('/messages') && req.method === 'GET') {
+        const urlParams = new URL(req.url, `http://${req.headers.host}`);
+        const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
+
         db.all(`SELECT m.id, m.text, m.image_path, m.username, m.role, m.timestamp, m.reply_to,
                 (SELECT text FROM messages WHERE id = m.reply_to) as reply_text,
                 (SELECT username FROM messages WHERE id = m.reply_to) as reply_username
-                FROM messages m ORDER BY m.id ASC LIMIT 100`, [], (err, rows) => {
+                FROM messages m WHERE m.id > ? ORDER BY m.id ASC`, [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
                 return;
             }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(rows));
+
+            if (rows.length > 0) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(rows));
+            } else {
+                clients.push({ res, lastId });
+            }
         });
     } 
     
@@ -514,7 +510,6 @@ const server = http.createServer((req, res) => {
                         [finalText || '', finalImagePath, session.username, userRole, replyId, timestamp, session.userId], 
                         function(err) {
                             if (err) {
-                                console.error('DB error:', err);
                                 res.writeHead(500);
                                 res.end();
                                 return;
@@ -531,7 +526,7 @@ const server = http.createServer((req, res) => {
                             };
                             
                             const sendResponse = () => {
-                                broadcastToAll('message', newMsg);
+                                broadcastToAll(newMsg);
                                 res.writeHead(200);
                                 res.end(JSON.stringify({ success: true }));
                             };
@@ -589,42 +584,6 @@ const server = http.createServer((req, res) => {
         });
     }
     
-    else if (req.url === '/ws' && req.headers['upgrade'] === 'websocket') {
-        const socket = req.socket;
-        const wsIp = getRealIp(req);
-        
-        const key = req.headers['sec-websocket-key'];
-        const acceptKey = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
-        
-        const response = [
-            'HTTP/1.1 101 Switching Protocols',
-            'Upgrade: websocket',
-            'Connection: Upgrade',
-            'Sec-WebSocket-Accept: ' + acceptKey,
-            '',
-            ''
-        ].join('\r\n');
-        
-        socket.write(response);
-        
-        wsClients.set(wsIp, socket);
-        broadcastOnlineCount();
-        
-        socket.on('data', (buffer) => {});
-        
-        socket.on('end', () => {
-            wsClients.delete(wsIp);
-            broadcastOnlineCount();
-        });
-        
-        socket.on('error', () => {
-            wsClients.delete(wsIp);
-            broadcastOnlineCount();
-        });
-        
-        socket.write(encodeWebSocketFrame(JSON.stringify({ type: 'online', data: wsClients.size })));
-    }
-    
     else {
         res.writeHead(404);
         res.end();
@@ -653,12 +612,12 @@ setInterval(() => {
         messageHistory.set('global', global);
     }
     
-    for (let [ip, socket] of wsClients.entries()) {
-        if (socket.destroyed || socket.closed) {
-            wsClients.delete(ip);
+    // Очистка активных пользователей
+    for (let [ip, lastSeen] of activeUsers.entries()) {
+        if (now - lastSeen > 30000) {
+            activeUsers.delete(ip);
         }
     }
-    broadcastOnlineCount();
 }, 30000);
 
 const port = Number(process.env.PORT) || 8080;
