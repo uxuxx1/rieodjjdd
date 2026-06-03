@@ -8,7 +8,6 @@ const dbPath = path.join(__dirname, 'chat.db');
 const db = new sqlite3.Database(dbPath);
 const uploadDir = path.join(__dirname, 'uploads');
 
-// Создаём папку для фото
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
 let clients = [];
@@ -89,7 +88,6 @@ function unbanByHash(targetHash) {
 }
 
 function clearAllMessages() {
-    // Удаляем все файлы фото
     const files = fs.readdirSync(uploadDir);
     for (let file of files) {
         fs.unlinkSync(path.join(uploadDir, file));
@@ -115,24 +113,6 @@ function isUsernameTaken(username, excludeHash, callback) {
     db.get('SELECT ip_hash FROM users WHERE username = ? AND ip_hash != ?', [username, excludeHash], (err, row) => {
         callback(!err && row);
     });
-}
-
-function parseMultipart(body, boundary) {
-    const parts = {};
-    const sections = body.split('--' + boundary);
-    for (let section of sections) {
-        if (section.includes('Content-Disposition')) {
-            const nameMatch = section.match(/name="([^"]+)"/);
-            if (nameMatch) {
-                const name = nameMatch[1];
-                const valueStart = section.indexOf('\r\n\r\n') + 4;
-                let value = section.slice(valueStart);
-                if (value.endsWith('\r\n')) value = value.slice(0, -2);
-                parts[name] = value;
-            }
-        }
-    }
-    return parts;
 }
 
 function checkSpamRules(ip, text, callback) {
@@ -363,7 +343,6 @@ const server = http.createServer((req, res) => {
         const isMultipart = contentType.includes('multipart/form-data');
         
         if (isMultipart) {
-            // Обработка фото
             let body = [];
             req.on('data', chunk => body.push(chunk));
             req.on('end', () => {
@@ -375,7 +354,6 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                // Парсим multipart
                 let text = '';
                 let imageData = null;
                 
@@ -412,11 +390,9 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                // Сохраняем фото если есть
                 let imagePath = '';
                 if (imageData) {
-                    const ext = '.jpg';
-                    const filename = Date.now() + '_' + Math.random().toString(36).substr(2, 8) + ext;
+                    const filename = Date.now() + '_' + Math.random().toString(36).substr(2, 8) + '.jpg';
                     imagePath = '/uploads/' + filename;
                     const fullPath = path.join(uploadDir, filename);
                     fs.writeFileSync(fullPath, imageData, 'binary');
@@ -467,14 +443,12 @@ const server = http.createServer((req, res) => {
                 });
             });
         } else {
-            // Обычный текст
             let body = '';
             req.on('data', chunk => { body += chunk; });
             req.on('end', () => {
                 try {
                     const data = JSON.parse(body);
                     let text = data.text ? data.text.trim() : '';
-                    let username = data.username ? data.username.trim().substring(0, 10) : '';
                     
                     if (text.length < 1 || text.length > 100) {
                         res.writeHead(400);
@@ -519,11 +493,11 @@ const server = http.createServer((req, res) => {
                         
                         getUsername(ipHash, (finalUsername) => {
                             db.run('INSERT INTO messages (text, image_path, username, timestamp, ip_hash) VALUES (?, ?, ?, ?, ?)', 
-                                [text, '', finalUsername || username || '', timestamp, ipHash], 
+                                [text, '', finalUsername || '', timestamp, ipHash], 
                                 function(err) {
                                     if (err) return;
                                     
-                                    const newMsg = { id: this.lastID, text: text, image_path: '', username: finalUsername || username || '', timestamp };
+                                    const newMsg = { id: this.lastID, text: text, image_path: '', username: finalUsername || '', timestamp };
                                     
                                     db.run(`DELETE FROM messages WHERE id NOT IN (
                                         SELECT id FROM messages ORDER BY id DESC LIMIT 100
