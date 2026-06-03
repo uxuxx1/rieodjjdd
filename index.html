@@ -207,13 +207,23 @@
         }
 
         .msg-name {
-            color: #fff;
             cursor: pointer;
         }
-
-        body.light .msg-name {
-            color: #000;
+        
+        .role-badge {
+            font-size: 9px;
+            padding: 2px 6px;
+            border-radius: 12px;
+            margin-left: 6px;
+            font-weight: normal;
         }
+        
+        .role-admin { background: #ff4444; color: white; }
+        .role-moder { background: #ff8800; color: white; }
+        .role-vip { background: #ffd700; color: #000; }
+        .role-user { background: #444; color: #ccc; }
+
+        body.light .role-user { background: #ddd; color: #666; }
 
         .msg-time {
             font-size: 10px;
@@ -532,6 +542,7 @@
         let clickTimer = null;
         let myToken = localStorage.getItem('chatToken');
         let myUsername = '';
+        let myRole = '';
         let replyToMsg = null;
         let ws = null;
         let wsReconnectTimer = null;
@@ -562,6 +573,16 @@
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
 
+        function getRoleBadge(role) {
+            const roleMap = {
+                'admin': '<span class="role-badge role-admin">admin</span>',
+                'moder': '<span class="role-badge role-moder">moder</span>',
+                'vip': '<span class="role-badge role-vip">vip</span>',
+                'user': '<span class="role-badge role-user">user</span>'
+            };
+            return roleMap[role] || '';
+        }
+
         function updateOnlineCount(count) {
             onlineCountSpan.textContent = 'online: ' + count;
         }
@@ -581,10 +602,14 @@
                 try {
                     const data = JSON.parse(event.data);
                     if (data.type === 'online') {
-                        updateOnlineCount(data.count);
+                        updateOnlineCount(data.data);
                     } else if (data.type === 'message') {
                         appendMessage(data.data);
                         if (data.data.id > lastId) lastId = data.data.id;
+                    } else if (data.type === 'clear') {
+                        lastId = -1;
+                        chatBox.innerHTML = '';
+                        loadHistory();
                     }
                 } catch(e) {}
             };
@@ -602,7 +627,7 @@
 
         function updateAuthUI() {
             if (myToken && myUsername) {
-                authButtons.innerHTML = '<span style="color:#fff; font-size:11px; margin-right:8px;">' + escapeHtml(myUsername) + '</span><button class="auth-btn logout-btn" id="logoutBtn">logout</button>';
+                authButtons.innerHTML = '<span style="color:#fff; font-size:11px; margin-right:8px;">' + escapeHtml(myUsername) + getRoleBadge(myRole) + '</span><button class="auth-btn logout-btn" id="logoutBtn">logout</button>';
                 document.getElementById('logoutBtn').addEventListener('click', logout);
                 msgInput.disabled = false;
                 photoBtn.disabled = false;
@@ -625,6 +650,7 @@
                 warningBanner.style.display = 'block';
                 myToken = null;
                 myUsername = '';
+                myRole = '';
                 localStorage.removeItem('chatToken');
             }
         }
@@ -640,6 +666,7 @@
                 const data = await res.json();
                 if (data.valid) {
                     myUsername = data.username;
+                    myRole = data.role || 'user';
                     return true;
                 } else {
                     myToken = null;
@@ -661,6 +688,7 @@
             }
             myToken = null;
             myUsername = '';
+            myRole = '';
             localStorage.removeItem('chatToken');
             updateAuthUI();
             showToast('Logged out');
@@ -685,6 +713,7 @@
                 const data = await res.json();
                 myToken = data.token;
                 myUsername = data.username;
+                myRole = data.role || 'user';
                 localStorage.setItem('chatToken', myToken);
                 updateAuthUI();
                 showToast('Welcome ' + myUsername + '!');
@@ -709,6 +738,7 @@
                 const data = await res.json();
                 myToken = data.token;
                 myUsername = data.username;
+                myRole = data.role || 'user';
                 localStorage.setItem('chatToken', myToken);
                 updateAuthUI();
                 showToast('Welcome back ' + myUsername + '!');
@@ -745,6 +775,7 @@
             div.id = 'msg-' + msg.id;
             div.className = 'message';
             const name = msg.username ? escapeHtml(msg.username) : 'anon';
+            const roleBadge = getRoleBadge(msg.role || 'user');
             let content = '';
             if(msg.image_path && msg.image_path !== '') {
                 const imgUrl = endpoint + msg.image_path;
@@ -757,6 +788,7 @@
                     replyHtml +
                     '<div class="msg-header">' +
                         '<span class="msg-name" data-id="' + msg.id + '">' + name + '</span>' +
+                        roleBadge +
                         '<span class="msg-time">' + escapeHtml(msg.timestamp) + '</span>' +
                         '<button class="reply-btn" data-id="' + msg.id + '" data-name="' + name + '">reply</button>' +
                     '</div>' +
@@ -788,8 +820,13 @@
                     showToast('Chat cleared');
                     lastId = -1;
                     chatBox.innerHTML = '';
+                    loadHistory();
                 } else if (data.banned) {
                     showToast('User banned');
+                } else if (data.roleChanged && data.newRole) {
+                    myRole = data.newRole;
+                    showToast('Your role changed to: ' + data.newRole);
+                    updateAuthUI();
                 } else {
                     showToast('Report sent');
                 }
@@ -955,9 +992,11 @@
 
         async function loadHistory() {
             try {
-                const res = await fetch(endpoint + '/messages?lastId=0');
+                const res = await fetch(endpoint + '/history');
                 if (res.status === 200) {
                     const list = await res.json();
+                    chatBox.innerHTML = '';
+                    lastId = -1;
                     for (let m of list) {
                         appendMessage(m);
                         if (m.id > lastId) lastId = m.id;
@@ -995,6 +1034,7 @@
             }
             await login(username, password);
             closeModals();
+            loadHistory();
         });
         
         document.getElementById('loginCancel').addEventListener('click', closeModals);
@@ -1012,6 +1052,7 @@
             }
             await register(username, password);
             closeModals();
+            loadHistory();
         });
         
         document.getElementById('registerCancel').addEventListener('click', closeModals);
@@ -1032,4 +1073,4 @@
     })();
 </script>
 </body>
-    </html>
+        </html>
