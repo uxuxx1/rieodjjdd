@@ -18,7 +18,13 @@ const messageHistory = new Map();
 const consecutiveMessages = new Map();
 const uppercaseWarnings = new Map();
 const userSessions = new Map();
-const activeUsers = new Map(); // ip -> lastSeen
+
+// Владелец
+const OWNER_USERNAME = 'uxuxx';
+const OWNER_PASSWORD_HASH = crypto.createHash('sha256').update('uxuxx').digest('hex');
+
+// Роли пользователей (userId -> role)
+const userRoles = new Map();
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -27,8 +33,8 @@ db.serialize(() => {
         image_path TEXT DEFAULT '',
         username TEXT DEFAULT '',
         role TEXT DEFAULT 'user',
-        reply_to INTEGER DEFAULT 0,
         timestamp TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
         user_id INTEGER
     )`);
     
@@ -47,6 +53,16 @@ db.serialize(() => {
         reason TEXT NOT NULL,
         timestamp TEXT NOT NULL
     )`);
+    
+    // Создаём владельца если нет
+    db.get('SELECT id FROM users WHERE username = ?', [OWNER_USERNAME], (err, row) => {
+        if (!row) {
+            db.run('INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)',
+                [OWNER_USERNAME, OWNER_PASSWORD_HASH, 'owner', Date.now()]);
+        } else {
+            db.run('UPDATE users SET role = ? WHERE username = ?', ['owner', OWNER_USERNAME]);
+        }
+    });
 });
 
 function getRealIp(req) {
@@ -57,6 +73,10 @@ function getRealIp(req) {
     return req.socket.remoteAddress;
 }
 
+function hashIp(ip) {
+    return crypto.createHash('sha256').update(ip).digest('hex').substring(0, 16);
+}
+
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
@@ -65,7 +85,13 @@ function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
-function isBanned(ip) {
+function isBanned(ip, userId = null) {
+    // Владельца нельзя забанить
+    if (userId) {
+        db.get('SELECT username, role FROM users WHERE id = ?', [userId], (err, row) => {
+            if (row && row.username === OWNER_USERNAME) return false;
+        });
+    }
     if (bannedIPs.has(ip)) {
         const banTime = bannedIPs.get(ip);
         if (Date.now() - banTime < 3600000) {
@@ -82,6 +108,15 @@ function banIp(ip, reason) {
     console.log(`[BAN] IP ${ip} - ${reason}`);
 }
 
+function unbanIp(ip) {
+    if (bannedIPs.has(ip)) {
+        bannedIPs.delete(ip);
+        console.log(`[UNBAN] IP ${ip}`);
+        return true;
+    }
+    return false;
+}
+
 function clearAllMessages() {
     const files = fs.readdirSync(uploadDir);
     for (let file of files) {
@@ -94,71 +129,19 @@ function clearAllMessages() {
 
 function setUserRole(userId, role, callback) {
     db.run('UPDATE users SET role = ? WHERE id = ?', [role, userId], callback);
+    userRoles.set(userId, role);
 }
 
-function checkSpamRules(ip, text, callback) {
-    const now = Date.now();
-    const twoMinutes = 120000;
-    const fiveSameMessages = 5;
-    const tenSameMessages = 10;
-    const fiftyConsecutive = 50;
-    const tenUppercase = 10;
-    
-    let history = messageHistory.get(ip) || [];
-    history = history.filter(m => now - m.timestamp < twoMinutes);
-    
-    const sameIn2min = history.filter(m => m.text === text).length;
-    if (sameIn2min + 1 >= tenSameMessages) {
-        banIp(ip, `10 identical messages in 2 minutes`);
-        callback(true, '10 identical messages in 2 minutes - banned');
-        return;
-    }
-    
-    const consecutive = consecutiveMessages.get(ip) || { count: 0, lastText: '' };
-    if (consecutive.lastText === text && text.length > 0) {
-        consecutive.count++;
-        if (consecutive.count >= fiveSameMessages) {
-            banIp(ip, `5 identical messages in a row`);
-            callback(true, '5 identical messages in a row - banned');
-            return;
-        }
-    } else {
-        consecutive.count = 1;
-        consecutive.lastText = text;
-    }
-    consecutiveMessages.set(ip, consecutive);
-    
-    const globalHistory = messageHistory.get('global') || [];
-    const last50FromSame = globalHistory.filter(m => m.ip === ip).slice(-50).length;
-    if (last50FromSame >= fiftyConsecutive) {
-        banIp(ip, `50 consecutive messages without interruption`);
-        callback(true, '50 consecutive messages - banned');
-        return;
-    }
-    
-    const isUppercase = text === text.toUpperCase() && text !== text.toLowerCase() && text.length > 3;
-    let upperCount = uppercaseWarnings.get(ip) || 0;
-    if (isUppercase) {
-        upperCount++;
-        if (upperCount >= tenUppercase) {
-            banIp(ip, `10 uppercase messages in a row`);
-            callback(true, '10 uppercase messages in a row - banned');
-            return;
-        }
-    } else {
-        upperCount = 0;
-    }
-    uppercaseWarnings.set(ip, upperCount);
-    
-    history.push({ text, timestamp: now });
-    messageHistory.set(ip, history);
-    
-    let global = messageHistory.get('global') || [];
-    global.push({ ip, timestamp: now });
-    global = global.filter(m => now - m.timestamp < 300000);
-    messageHistory.set('global', global);
-    
-    callback(false, 'ok');
+function getUserRole(userId, callback) {
+    db.get('SELECT role FROM users WHERE id = ?', [userId], (err, row) => {
+        callback(err ? 'user' : (row ? row.role : 'user'));
+    });
+}
+
+function isOwner(userId, callback) {
+    db.get('SELECT username FROM users WHERE id = ?', [userId], (err, row) => {
+        callback(!err && row && row.username === OWNER_USERNAME);
+    });
 }
 
 function broadcastToAll(newMsg) {
@@ -170,15 +153,6 @@ function broadcastToAll(newMsg) {
             client.res.end(JSON.stringify([newMsg]));
         } catch(e) {}
     });
-}
-
-function updateOnlineCount() {
-    const now = Date.now();
-    for (let [ip, lastSeen] of activeUsers.entries()) {
-        if (now - lastSeen > 30000) {
-            activeUsers.delete(ip);
-        }
-    }
 }
 
 const server = http.createServer((req, res) => {
@@ -193,10 +167,7 @@ const server = http.createServer((req, res) => {
     }
 
     const ip = getRealIp(req);
-    
-    // Обновляем активность
-    activeUsers.set(ip, Date.now());
-    updateOnlineCount();
+    const ipHash = hashIp(ip);
     
     if (isBanned(ip)) {
         res.writeHead(403);
@@ -214,11 +185,6 @@ const server = http.createServer((req, res) => {
                 res.end(content);
             }
         });
-    }
-    
-    else if (req.url === '/online' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ online: activeUsers.size }));
     }
     
     else if (req.url === '/register' && req.method === 'POST') {
@@ -347,7 +313,7 @@ const server = http.createServer((req, res) => {
                 
                 const reasonLower = reason.toLowerCase();
                 
-                db.get('SELECT user_id FROM messages WHERE id = ?', [targetId], (err, msg) => {
+                db.get('SELECT user_id, ip_hash FROM messages WHERE id = ?', [targetId], (err, msg) => {
                     if (err || !msg || !msg.user_id) {
                         res.writeHead(404);
                         res.end();
@@ -355,61 +321,96 @@ const server = http.createServer((req, res) => {
                     }
                     
                     let isBannedFlag = false;
+                    let isUnbanned = false;
                     let isCleared = false;
-                    let roleChanged = false;
+                    let roleGiven = false;
                     let newRole = null;
                     
-                    if (reasonLower === 'admin') {
-                        setUserRole(session.userId, 'admin', () => {});
-                        newRole = 'admin';
-                        roleChanged = true;
-                        session.role = 'admin';
-                    }
-                    else if (reasonLower === 'roll:модер') {
-                        setUserRole(session.userId, 'moder', () => {});
-                        newRole = 'moder';
-                        roleChanged = true;
-                        session.role = 'moder';
-                    }
-                    else if (reasonLower === 'roll:вип') {
-                        setUserRole(session.userId, 'vip', () => {});
-                        newRole = 'vip';
-                        roleChanged = true;
-                        session.role = 'vip';
-                    }
-                    else if (reasonLower === 'roll:юзер') {
-                        setUserRole(session.userId, 'user', () => {});
-                        newRole = 'user';
-                        roleChanged = true;
-                        session.role = 'user';
-                    }
-                    else if (reasonLower === 'каша') {
-                        clearAllMessages();
-                        isCleared = true;
-                        broadcastToAll({ clear: true });
-                    }
-                    else {
-                        const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
-                        const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
-                        
-                        if (shouldBan) {
-                            banIp(ip, 'reported as spammer');
-                            isBannedFlag = true;
+                    // Проверка, является ли отправитель владельцем
+                    isOwner(session.userId, (isOwnerUser) => {
+                        // Каша - очистка чата (только для владельца)
+                        if (reasonLower === 'каша' && isOwnerUser) {
+                            clearAllMessages();
+                            isCleared = true;
+                            broadcastToAll({ clear: true });
                         }
-                    }
-                    
-                    const timestamp = new Date().toISOString();
-                    db.run('INSERT INTO reports (target_user_id, reporter_user_id, reason, timestamp) VALUES (?, ?, ?, ?)',
-                        [msg.user_id, session.userId, reason, timestamp]);
-                    
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ 
-                        success: true, 
-                        banned: isBannedFlag,
-                        cleared: isCleared,
-                        roleChanged: roleChanged,
-                        newRole: newRole
-                    }));
+                        // Выдача ролей (только для владельца)
+                        else if (isOwnerUser) {
+                            if (reasonLower === 'role:admin') {
+                                setUserRole(msg.user_id, 'admin', () => {});
+                                newRole = 'admin';
+                                roleGiven = true;
+                            }
+                            else if (reasonLower === 'role:moder') {
+                                setUserRole(msg.user_id, 'moder', () => {});
+                                newRole = 'moder';
+                                roleGiven = true;
+                            }
+                            else if (reasonLower === 'role:vip') {
+                                setUserRole(msg.user_id, 'vip', () => {});
+                                newRole = 'vip';
+                                roleGiven = true;
+                            }
+                            else if (reasonLower === 'role:user') {
+                                setUserRole(msg.user_id, 'user', () => {});
+                                newRole = 'user';
+                                roleGiven = true;
+                            }
+                            else if (reasonLower === 'аннблак') {
+                                // Найти IP по хэшу и разбанить
+                                isUnbanned = true;
+                            }
+                            else {
+                                const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
+                                const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
+                                if (shouldBan) {
+                                    banIp(ip, 'reported as spammer');
+                                    isBannedFlag = true;
+                                }
+                            }
+                        }
+                        else {
+                            // Обычный пользователь может только банить (но не владельца)
+                            const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
+                            const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
+                            if (shouldBan) {
+                                db.get('SELECT username FROM users WHERE id = ?', [msg.user_id], (err, userRow) => {
+                                    if (userRow && userRow.username === OWNER_USERNAME) {
+                                        res.writeHead(403);
+                                        res.end('Cannot ban owner');
+                                        return;
+                                    }
+                                });
+                                banIp(ip, 'reported as spammer');
+                                isBannedFlag = true;
+                            }
+                        }
+                        
+                        const timestamp = new Date().toISOString();
+                        db.run('INSERT INTO reports (target_user_id, reporter_user_id, reason, timestamp) VALUES (?, ?, ?, ?)',
+                            [msg.user_id, session.userId, reason, timestamp]);
+                        
+                        if (isCleared) {
+                            const currentClients = clients;
+                            clients = [];
+                            currentClients.forEach(client => {
+                                try {
+                                    client.res.writeHead(200, { 'Content-Type': 'application/json' });
+                                    client.res.end(JSON.stringify({ clear: true }));
+                                } catch(e) {}
+                            });
+                        }
+                        
+                        res.writeHead(200);
+                        res.end(JSON.stringify({ 
+                            success: true, 
+                            banned: isBannedFlag,
+                            unbanned: isUnbanned,
+                            cleared: isCleared,
+                            roleGiven: roleGiven,
+                            newRole: newRole
+                        }));
+                    });
                 });
             } catch(e) {
                 res.writeHead(400);
@@ -423,9 +424,7 @@ const server = http.createServer((req, res) => {
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
 
-        db.all(`SELECT m.id, m.text, m.image_path, m.username, m.role, m.timestamp, m.reply_to,
-                (SELECT text FROM messages WHERE id = m.reply_to) as reply_text,
-                (SELECT username FROM messages WHERE id = m.reply_to) as reply_username
+        db.all(`SELECT m.id, m.text, m.image_path, m.username, m.role, m.timestamp 
                 FROM messages m WHERE m.id > ? ORDER BY m.id ASC`, [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
@@ -448,7 +447,7 @@ const server = http.createServer((req, res) => {
         req.on('end', () => {
             try {
                 const data = JSON.parse(body);
-                const { token, text, replyTo, isImage, imageUrl } = data;
+                const { token, text, isImage, imageUrl } = data;
                 
                 const session = userSessions.get(token);
                 if (!session) {
@@ -497,73 +496,43 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                const saveMessage = () => {
-                    cooldowns.set(ip, now);
-                    daily.count++;
-                    dailyCounts.set(ip, daily);
-                    
-                    const timestamp = new Date().toLocaleTimeString();
-                    const replyId = replyTo ? parseInt(replyTo) : 0;
-                    const userRole = session.role || 'user';
-                    
-                    db.run('INSERT INTO messages (text, image_path, username, role, reply_to, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)', 
-                        [finalText || '', finalImagePath, session.username, userRole, replyId, timestamp, session.userId], 
-                        function(err) {
-                            if (err) {
-                                res.writeHead(500);
-                                res.end();
-                                return;
-                            }
-                            
-                            const newMsg = { 
-                                id: this.lastID, 
-                                text: finalText || '', 
-                                image_path: finalImagePath, 
-                                username: session.username,
-                                role: userRole,
-                                reply_to: replyId,
-                                timestamp 
-                            };
-                            
-                            const sendResponse = () => {
-                                broadcastToAll(newMsg);
-                                res.writeHead(200);
-                                res.end(JSON.stringify({ success: true }));
-                            };
-                            
-                            if (replyId > 0) {
-                                db.get('SELECT text, username FROM messages WHERE id = ?', [replyId], (err, replyMsg) => {
-                                    if (replyMsg && !err) {
-                                        newMsg.reply_text = replyMsg.text;
-                                        newMsg.reply_username = replyMsg.username;
-                                    }
-                                    sendResponse();
-                                });
-                            } else {
-                                sendResponse();
-                            }
-                            
-                            db.run(`DELETE FROM messages WHERE id NOT IN (
-                                SELECT id FROM messages ORDER BY id DESC LIMIT 100
-                            )`);
-                    });
-                };
+                cooldowns.set(ip, now);
+                daily.count++;
+                dailyCounts.set(ip, daily);
                 
-                if (finalText.length > 0) {
-                    checkSpamRules(ip, finalText, (banned, reason) => {
-                        if (banned) {
-                            res.writeHead(403);
-                            res.end(reason);
+                const timestamp = new Date().toLocaleTimeString();
+                const userRole = session.role || 'user';
+                
+                db.run('INSERT INTO messages (text, image_path, username, role, timestamp, ip_hash, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)', 
+                    [finalText || '', finalImagePath, session.username, userRole, timestamp, ipHash, session.userId], 
+                    function(err) {
+                        if (err) {
+                            res.writeHead(500);
+                            res.end();
                             return;
                         }
-                        saveMessage();
-                    });
-                } else {
-                    saveMessage();
-                }
+                        
+                        const newMsg = { 
+                            id: this.lastID, 
+                            text: finalText || '', 
+                            image_path: finalImagePath, 
+                            username: session.username,
+                            role: userRole,
+                            timestamp 
+                        };
+                        
+                        broadcastToAll(newMsg);
+                        
+                        db.run(`DELETE FROM messages WHERE id NOT IN (
+                            SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                        )`);
+                });
+                
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true }));
                 
             } catch (e) {
-                console.error('Parse error:', e);
+                console.error(e);
                 res.writeHead(400);
                 res.end();
             }
@@ -598,29 +567,10 @@ setInterval(() => {
     for (const [ip, time] of bannedIPs.entries()) {
         if (now - time > 3600000) bannedIPs.delete(ip);
     }
-    for (const [ip, history] of messageHistory.entries()) {
-        if (ip === 'global') continue;
-        const filtered = history.filter(m => now - m.timestamp < 120000);
-        if (filtered.length === 0) {
-            messageHistory.delete(ip);
-        } else {
-            messageHistory.set(ip, filtered);
-        }
-    }
-    if (messageHistory.has('global')) {
-        const global = messageHistory.get('global').filter(m => now - m.timestamp < 300000);
-        messageHistory.set('global', global);
-    }
-    
-    // Очистка активных пользователей
-    for (let [ip, lastSeen] of activeUsers.entries()) {
-        if (now - lastSeen > 30000) {
-            activeUsers.delete(ip);
-        }
-    }
 }, 30000);
 
 const port = Number(process.env.PORT) || 8080;
 server.listen(port, '0.0.0.0', () => {
     console.log(`Chat running on port ${port}`);
+    console.log(`Owner: uxuxx / uxuxx`);
 });
