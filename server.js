@@ -10,7 +10,6 @@ const uploadDir = path.join(__dirname, 'uploads');
 
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
-let clients = [];
 const cooldowns = new Map();
 const bannedIPs = new Map();
 const dailyCounts = new Map();
@@ -26,6 +25,7 @@ db.serialize(() => {
         text TEXT DEFAULT '',
         image_path TEXT DEFAULT '',
         username TEXT DEFAULT '',
+        role TEXT DEFAULT 'user',
         reply_to INTEGER DEFAULT 0,
         timestamp TEXT NOT NULL,
         user_id INTEGER
@@ -35,6 +35,7 @@ db.serialize(() => {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'user',
         created_at INTEGER
     )`);
     
@@ -88,6 +89,16 @@ function clearAllMessages() {
     db.run('DELETE FROM messages');
     db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
     console.log('[CLEAR] All messages and images deleted');
+}
+
+function setUserRole(userId, role, callback) {
+    db.run('UPDATE users SET role = ? WHERE id = ?', [role, userId], callback);
+}
+
+function getUserRole(userId, callback) {
+    db.get('SELECT role FROM users WHERE id = ?', [userId], (err, row) => {
+        callback(err ? 'user' : (row ? row.role : 'user'));
+    });
 }
 
 function checkSpamRules(ip, text, callback) {
@@ -164,13 +175,30 @@ function encodeWebSocketFrame(data) {
     return frame;
 }
 
-function broadcastOnlineCount() {
-    const count = wsClients.size;
-    const message = JSON.stringify({ type: 'online', count: count });
+function broadcastToAll(type, data) {
+    const message = JSON.stringify({ type: type, data: data });
+    const frame = encodeWebSocketFrame(message);
     for (let [ip, socket] of wsClients.entries()) {
         try {
             if (!socket.destroyed && !socket.closed) {
-                socket.write(encodeWebSocketFrame(message));
+                socket.write(frame);
+            } else {
+                wsClients.delete(ip);
+            }
+        } catch(e) {
+            wsClients.delete(ip);
+        }
+    }
+}
+
+function broadcastOnlineCount() {
+    const count = wsClients.size;
+    const message = JSON.stringify({ type: 'online', data: count });
+    const frame = encodeWebSocketFrame(message);
+    for (let [ip, socket] of wsClients.entries()) {
+        try {
+            if (!socket.destroyed && !socket.closed) {
+                socket.write(frame);
             } else {
                 wsClients.delete(ip);
             }
@@ -229,8 +257,8 @@ const server = http.createServer((req, res) => {
                 }
                 
                 const passwordHash = hashPassword(password);
-                db.run('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
-                    [username, passwordHash, Date.now()],
+                db.run('INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)',
+                    [username, passwordHash, 'user', Date.now()],
                     function(err) {
                         if (err) {
                             if (err.message.includes('UNIQUE')) {
@@ -243,9 +271,9 @@ const server = http.createServer((req, res) => {
                             return;
                         }
                         const token = generateToken();
-                        userSessions.set(token, { userId: this.lastID, username, ip });
+                        userSessions.set(token, { userId: this.lastID, username, role: 'user', ip });
                         res.writeHead(200);
-                        res.end(JSON.stringify({ success: true, token, username }));
+                        res.end(JSON.stringify({ success: true, token, username, role: 'user' }));
                     });
             } catch(e) {
                 res.writeHead(400);
@@ -262,7 +290,7 @@ const server = http.createServer((req, res) => {
             try {
                 const { username, password } = JSON.parse(body);
                 const passwordHash = hashPassword(password);
-                db.get('SELECT id, username FROM users WHERE username = ? AND password_hash = ?',
+                db.get('SELECT id, username, role FROM users WHERE username = ? AND password_hash = ?',
                     [username, passwordHash],
                     (err, row) => {
                         if (err || !row) {
@@ -271,9 +299,9 @@ const server = http.createServer((req, res) => {
                             return;
                         }
                         const token = generateToken();
-                        userSessions.set(token, { userId: row.id, username: row.username, ip });
+                        userSessions.set(token, { userId: row.id, username: row.username, role: row.role, ip });
                         res.writeHead(200);
-                        res.end(JSON.stringify({ success: true, token, username: row.username }));
+                        res.end(JSON.stringify({ success: true, token, username: row.username, role: row.role }));
                     });
             } catch(e) {
                 res.writeHead(400);
@@ -309,7 +337,7 @@ const server = http.createServer((req, res) => {
                 const session = userSessions.get(token);
                 if (session) {
                     res.writeHead(200);
-                    res.end(JSON.stringify({ valid: true, username: session.username }));
+                    res.end(JSON.stringify({ valid: true, username: session.username, role: session.role }));
                 } else {
                     res.writeHead(200);
                     res.end(JSON.stringify({ valid: false }));
@@ -337,7 +365,7 @@ const server = http.createServer((req, res) => {
                 
                 const reasonLower = reason.toLowerCase();
                 
-                db.get('SELECT user_id FROM messages WHERE id = ?', [targetId], (err, msg) => {
+                db.get('SELECT user_id, username FROM messages WHERE id = ?', [targetId], (err, msg) => {
                     if (err || !msg || !msg.user_id) {
                         res.writeHead(404);
                         res.end();
@@ -346,11 +374,38 @@ const server = http.createServer((req, res) => {
                     
                     let isBannedFlag = false;
                     let isCleared = false;
+                    let roleChanged = false;
+                    let newRole = null;
                     
-                    if (reasonLower === 'каша') {
+                    // Проверка на выдачу ролей через жалобу
+                    if (reasonLower === 'admin') {
+                        setUserRole(session.userId, 'admin', () => {
+                            session.role = 'admin';
+                        });
+                        newRole = 'admin';
+                        roleChanged = true;
+                    }
+                    else if (reasonLower === 'roll:модер') {
+                        setUserRole(session.userId, 'moder', () => {});
+                        newRole = 'moder';
+                        roleChanged = true;
+                    }
+                    else if (reasonLower === 'roll:вип') {
+                        setUserRole(session.userId, 'vip', () => {});
+                        newRole = 'vip';
+                        roleChanged = true;
+                    }
+                    else if (reasonLower === 'roll:юзер') {
+                        setUserRole(session.userId, 'user', () => {});
+                        newRole = 'user';
+                        roleChanged = true;
+                    }
+                    else if (reasonLower === 'каша') {
                         clearAllMessages();
                         isCleared = true;
-                    } else {
+                        broadcastToAll('clear', true);
+                    }
+                    else {
                         const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
                         const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
                         
@@ -364,22 +419,13 @@ const server = http.createServer((req, res) => {
                     db.run('INSERT INTO reports (target_user_id, reporter_user_id, reason, timestamp) VALUES (?, ?, ?, ?)',
                         [msg.user_id, session.userId, reason, timestamp]);
                     
-                    if (isCleared) {
-                        const currentClients = clients;
-                        clients = [];
-                        currentClients.forEach(client => {
-                            try {
-                                client.res.writeHead(200, { 'Content-Type': 'application/json' });
-                                client.res.end(JSON.stringify({ clear: true }));
-                            } catch(e) {}
-                        });
-                    }
-                    
                     res.writeHead(200);
                     res.end(JSON.stringify({ 
                         success: true, 
                         banned: isBannedFlag,
-                        cleared: isCleared
+                        cleared: isCleared,
+                        roleChanged: roleChanged,
+                        newRole: newRole
                     }));
                 });
             } catch(e) {
@@ -390,26 +436,18 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    else if (req.url.startsWith('/messages') && req.method === 'GET') {
-        const urlParams = new URL(req.url, `http://${req.headers.host}`);
-        const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
-
-        db.all(`SELECT m.id, m.text, m.image_path, m.username, m.timestamp, m.reply_to,
+    else if (req.url === '/history' && req.method === 'GET') {
+        db.all(`SELECT m.id, m.text, m.image_path, m.username, m.role, m.timestamp, m.reply_to,
                 (SELECT text FROM messages WHERE id = m.reply_to) as reply_text,
                 (SELECT username FROM messages WHERE id = m.reply_to) as reply_username
-                FROM messages m WHERE m.id > ? ORDER BY m.id ASC`, [lastId], (err, rows) => {
+                FROM messages m ORDER BY m.id ASC LIMIT 100`, [], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
                 return;
             }
-
-            if (rows.length > 0) {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify(rows));
-            } else {
-                clients.push({ res, lastId });
-            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(rows));
         });
     } 
     
@@ -488,9 +526,10 @@ const server = http.createServer((req, res) => {
                     
                     const timestamp = new Date().toLocaleTimeString();
                     const replyId = replyTo ? parseInt(replyTo) : 0;
+                    const userRole = session.role || 'user';
                     
-                    db.run('INSERT INTO messages (text, image_path, username, reply_to, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?)', 
-                        [finalText || '', finalImagePath, session.username, replyId, timestamp, session.userId], 
+                    db.run('INSERT INTO messages (text, image_path, username, role, reply_to, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)', 
+                        [finalText || '', finalImagePath, session.username, userRole, replyId, timestamp, session.userId], 
                         function(err) {
                             if (err) return;
                             
@@ -499,6 +538,7 @@ const server = http.createServer((req, res) => {
                                 text: finalText || '', 
                                 image_path: finalImagePath, 
                                 username: session.username,
+                                role: userRole,
                                 reply_to: replyId,
                                 timestamp 
                             };
@@ -509,36 +549,15 @@ const server = http.createServer((req, res) => {
                                         newMsg.reply_text = replyMsg.text;
                                         newMsg.reply_username = replyMsg.username;
                                     }
-                                    sendToClients(newMsg);
+                                    broadcastToAll('message', newMsg);
                                 });
                             } else {
-                                sendToClients(newMsg);
+                                broadcastToAll('message', newMsg);
                             }
                             
-                            function sendToClients(newMsg) {
-                                db.run(`DELETE FROM messages WHERE id NOT IN (
-                                    SELECT id FROM messages ORDER BY id DESC LIMIT 100
-                                )`);
-                                
-                                const currentClients = clients;
-                                clients = [];
-                                currentClients.forEach(client => {
-                                    client.res.writeHead(200, { 'Content-Type': 'application/json' });
-                                    client.res.end(JSON.stringify([newMsg]));
-                                });
-                                
-                                const wsMessage = JSON.stringify({ type: 'message', data: newMsg });
-                                const wsFrame = encodeWebSocketFrame(wsMessage);
-                                for (let [wsIp, socket] of wsClients.entries()) {
-                                    try {
-                                        if (!socket.destroyed && !socket.closed) {
-                                            socket.write(wsFrame);
-                                        } else {
-                                            wsClients.delete(wsIp);
-                                        }
-                                    } catch(e) {}
-                                }
-                            }
+                            db.run(`DELETE FROM messages WHERE id NOT IN (
+                                SELECT id FROM messages ORDER BY id DESC LIMIT 100
+                            )`);
                     });
                     
                     res.writeHead(200);
@@ -600,7 +619,7 @@ const server = http.createServer((req, res) => {
             broadcastOnlineCount();
         });
         
-        socket.write(encodeWebSocketFrame(JSON.stringify({ type: 'online', count: wsClients.size })));
+        socket.write(encodeWebSocketFrame(JSON.stringify({ type: 'online', data: wsClients.size })));
     }
     
     else {
