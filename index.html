@@ -5,11 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>global chat</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         html, body {
             height: 100%;
@@ -29,7 +25,6 @@
             height: 100%;
         }
 
-        /* Шапка с кнопкой */
         .top-bar {
             display: flex;
             justify-content: flex-end;
@@ -50,11 +45,6 @@
             clip-path: polygon(0% 0%, 100% 0%, 90% 100%, 0% 100%);
         }
 
-        .username-btn:active {
-            background: #333;
-        }
-
-        /* Область сообщений */
         .chat-area {
             flex: 1;
             overflow-y: auto;
@@ -107,8 +97,14 @@
             color: #222;
             line-height: 1.3;
         }
+        
+        .msg-image {
+            max-width: 200px;
+            max-height: 200px;
+            border-radius: 8px;
+            margin-top: 4px;
+        }
 
-        /* Панель ввода — всегда видна, прижата к низу */
         .input-panel {
             display: flex;
             gap: 8px;
@@ -126,14 +122,13 @@
             padding: 0 14px;
             font-size: 14px;
             outline: none;
-            background: #fff;
         }
 
         .input-field:focus {
             border-color: #000;
         }
 
-        .send-btn {
+        .send-btn, .photo-btn {
             height: 40px;
             padding: 0 18px;
             background: #000;
@@ -144,11 +139,14 @@
             cursor: pointer;
         }
 
-        .send-btn:disabled {
+        .send-btn:disabled, .photo-btn:disabled {
             opacity: 0.5;
         }
+        
+        #photoInput {
+            display: none;
+        }
 
-        /* Модальные окна */
         .modal {
             position: fixed;
             top: 0;
@@ -229,11 +227,13 @@
 <div class="chat-area" id="chatBox"></div>
 
 <div class="input-panel">
+    <button class="photo-btn" id="photoBtn">+</button>
     <input type="text" id="msgInput" class="input-field" placeholder="" maxlength="100" autocomplete="off">
     <button id="sendBtn" class="send-btn">#</button>
 </div>
 
-<!-- Модалка репорта -->
+<input type="file" id="photoInput" accept="image/*">
+
 <div id="reportModal" class="modal">
     <div class="modal-content">
         <h4>Report</h4>
@@ -245,7 +245,6 @@
     </div>
 </div>
 
-<!-- Модалка username -->
 <div id="usernameModal" class="modal">
     <div class="modal-content">
         <h4>Set username</h4>
@@ -263,6 +262,8 @@
         const chatBox = document.getElementById('chatBox');
         const msgInput = document.getElementById('msgInput');
         const sendBtn = document.getElementById('sendBtn');
+        const photoBtn = document.getElementById('photoBtn');
+        const photoInput = document.getElementById('photoInput');
         const avatarUrl = 'https://avatars.mds.yandex.net/i?id=eaf679ea7a219ab8023bcadc1157f73c_l-4248551-images-thumbs&n=33&w=1080&h=1080';
 
         let lastId = -1;
@@ -293,6 +294,13 @@
             div.id = `msg-${msg.id}`;
             div.className = 'message';
             const name = msg.username ? escapeHtml(msg.username) : 'anon';
+            let content = '';
+            if(msg.image_path && msg.image_path !== '') {
+                const imgUrl = endpoint + msg.image_path;
+                content = `<img src="${escapeHtml(imgUrl)}" class="msg-image" alt="image">`;
+            } else {
+                content = `<div class="msg-text">${escapeHtml(msg.text)}</div>`;
+            }
             div.innerHTML = `
                 <img src="${avatarUrl}" class="avatar" data-id="${msg.id}" alt="avatar">
                 <div class="msg-body">
@@ -300,7 +308,7 @@
                         <span class="msg-name">${name}</span>
                         <span class="msg-time">${escapeHtml(msg.timestamp)}</span>
                     </div>
-                    <div class="msg-text">${escapeHtml(msg.text)}</div>
+                    ${content}
                 </div>
             `;
             chatBox.appendChild(div);
@@ -385,13 +393,73 @@
             }
         }
 
-        async function sendMessage() {
-            const text = msgInput.value.trim();
-            if(!text || text.length > 100 || isCooldown) return;
-            msgInput.value = '';
+        async function sendMessageWithImage(imageFile) {
+            const formData = new FormData();
+            formData.append('text', '');
+            formData.append('image', imageFile);
             
+            try {
+                const res = await fetch(`${endpoint}/send`, {
+                    method: 'POST',
+                    body: formData
+                });
+                if(res.status === 429) {
+                    const txt = await res.text();
+                    showToast(txt, true);
+                    return false;
+                }
+                if(res.status === 403) {
+                    const txt = await res.text();
+                    showToast(txt, true);
+                    setTimeout(() => location.reload(), 3000);
+                    return false;
+                }
+                return true;
+            } catch(e) {
+                return false;
+            }
+        }
+
+        async function sendMessage(text) {
+            const formData = new FormData();
+            formData.append('text', text);
+            
+            try {
+                const res = await fetch(`${endpoint}/send`, {
+                    method: 'POST',
+                    body: formData
+                });
+                if(res.status === 429) {
+                    const txt = await res.text();
+                    showToast(txt, true);
+                    return false;
+                }
+                if(res.status === 403) {
+                    const txt = await res.text();
+                    showToast(txt, true);
+                    setTimeout(() => location.reload(), 3000);
+                    return false;
+                }
+                return true;
+            } catch(e) {
+                return false;
+            }
+        }
+
+        async function handleSendMessage() {
+            const text = msgInput.value.trim();
+            if((!text || text.length > 100) && isCooldown) return;
+            if(isCooldown) return;
+            
+            msgInput.value = '';
+            startCooldown();
+            const success = await sendMessage(text);
+        }
+        
+        function startCooldown() {
             isCooldown = true;
             sendBtn.disabled = true;
+            photoBtn.disabled = true;
             msgInput.disabled = true;
             let sec = 2;
             msgInput.placeholder = `${sec}s...`;
@@ -403,28 +471,30 @@
                     clearInterval(timer);
                     isCooldown = false;
                     sendBtn.disabled = false;
+                    photoBtn.disabled = false;
                     msgInput.disabled = false;
                     msgInput.placeholder = '';
                     msgInput.focus();
                 }
             }, 1000);
+        }
 
-            try {
-                const res = await fetch(`${endpoint}/send`, {
-                    method: 'POST',
-                    headers: {'Content-Type':'application/json'},
-                    body: JSON.stringify({ text, username: myUsername })
-                });
-                if(res.status === 429) {
-                    const txt = await res.text();
-                    showToast(txt, true);
-                }
-                if(res.status === 403) {
-                    const txt = await res.text();
-                    showToast(txt, true);
-                    setTimeout(() => location.reload(), 3000);
-                }
-            } catch(e) {}
+        function handlePhotoUpload() {
+            const file = photoInput.files[0];
+            if(!file) return;
+            if(!file.type.startsWith('image/')) {
+                showToast('Only images', true);
+                return;
+            }
+            if(file.size > 5 * 1024 * 1024) {
+                showToast('Max 5MB', true);
+                return;
+            }
+            
+            if(isCooldown) return;
+            startCooldown();
+            sendMessageWithImage(file);
+            photoInput.value = '';
         }
 
         async function pollMessages() {
@@ -469,9 +539,11 @@
             }
         }
 
-        sendBtn.addEventListener('click', sendMessage);
+        sendBtn.addEventListener('click', handleSendMessage);
+        photoBtn.addEventListener('click', () => photoInput.click());
+        photoInput.addEventListener('change', handlePhotoUpload);
         msgInput.addEventListener('keydown', (e) => {
-            if(e.key === 'Enter' && !isCooldown) sendMessage();
+            if(e.key === 'Enter' && !isCooldown) handleSendMessage();
         });
         document.getElementById('usernameBtn').addEventListener('click', openUsernameModal);
         document.getElementById('usernameSave').addEventListener('click', saveUsernameModal);
