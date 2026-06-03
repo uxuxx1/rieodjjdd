@@ -13,12 +13,11 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 let clients = [];
 const cooldowns = new Map();
 const bannedIPs = new Map();
-const ipToHash = new Map();
-const hashToIp = new Map();
 const dailyCounts = new Map();
 const messageHistory = new Map();
 const consecutiveMessages = new Map();
 const uppercaseWarnings = new Map();
+const userSessions = new Map(); // token -> { userId, username, ip }
 
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -26,20 +25,22 @@ db.serialize(() => {
         text TEXT DEFAULT '',
         image_path TEXT DEFAULT '',
         username TEXT DEFAULT '',
+        reply_to INTEGER DEFAULT 0,
         timestamp TEXT NOT NULL,
-        ip_hash TEXT NOT NULL
+        user_id INTEGER
     )`);
     
     db.run(`CREATE TABLE IF NOT EXISTS users (
-        ip_hash TEXT PRIMARY KEY,
-        username TEXT DEFAULT '',
-        updated_at INTEGER
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at INTEGER
     )`);
     
     db.run(`CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_ip_hash TEXT NOT NULL,
-        reporter_ip_hash TEXT NOT NULL,
+        target_user_id INTEGER NOT NULL,
+        reporter_user_id INTEGER NOT NULL,
         reason TEXT NOT NULL,
         timestamp TEXT NOT NULL
     )`);
@@ -53,8 +54,12 @@ function getRealIp(req) {
     return req.socket.remoteAddress;
 }
 
-function hashIp(ip) {
-    return crypto.createHash('sha256').update(ip).digest('hex').substring(0, 16);
+function hashPassword(password) {
+    return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
 }
 
 function isBanned(ip) {
@@ -74,19 +79,6 @@ function banIp(ip, reason) {
     console.log(`[BAN] IP ${ip} - ${reason}`);
 }
 
-function unbanByHash(targetHash) {
-    for (let [ip, hash] of ipToHash.entries()) {
-        if (hash === targetHash) {
-            if (bannedIPs.has(ip)) {
-                bannedIPs.delete(ip);
-                console.log(`[UNBAN] IP ${ip}`);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 function clearAllMessages() {
     const files = fs.readdirSync(uploadDir);
     for (let file of files) {
@@ -95,24 +87,6 @@ function clearAllMessages() {
     db.run('DELETE FROM messages');
     db.run('DELETE FROM sqlite_sequence WHERE name="messages"');
     console.log('[CLEAR] All messages and images deleted');
-}
-
-function getUsername(ipHash, callback) {
-    db.get('SELECT username FROM users WHERE ip_hash = ?', [ipHash], (err, row) => {
-        callback(err || !row ? '' : (row.username || ''));
-    });
-}
-
-function setUsername(ipHash, username, callback) {
-    const now = Date.now();
-    db.run(`INSERT OR REPLACE INTO users (ip_hash, username, updated_at) VALUES (?, ?, ?)`,
-        [ipHash, username.substring(0, 10), now], callback);
-}
-
-function isUsernameTaken(username, excludeHash, callback) {
-    db.get('SELECT ip_hash FROM users WHERE username = ? AND ip_hash != ?', [username, excludeHash], (err, row) => {
-        callback(!err && row);
-    });
 }
 
 function checkSpamRules(ip, text, callback) {
@@ -192,10 +166,6 @@ const server = http.createServer((req, res) => {
     }
 
     const ip = getRealIp(req);
-    const ipHash = hashIp(ip);
-    
-    ipToHash.set(ip, ipHash);
-    hashToIp.set(ipHash, ip);
     
     if (isBanned(ip)) {
         res.writeHead(403);
@@ -215,25 +185,42 @@ const server = http.createServer((req, res) => {
         });
     }
     
-    else if (req.url === '/username' && req.method === 'POST') {
+    else if (req.url === '/register' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
             try {
-                const { username } = JSON.parse(body);
-                const cleanUsername = username ? username.trim().substring(0, 10) : '';
+                const { username, password } = JSON.parse(body);
+                if (!username || username.length < 3 || username.length > 12) {
+                    res.writeHead(400);
+                    res.end('Username must be 3-12 chars');
+                    return;
+                }
+                if (!password || password.length < 3 || password.length > 20) {
+                    res.writeHead(400);
+                    res.end('Password must be 3-20 chars');
+                    return;
+                }
                 
-                isUsernameTaken(cleanUsername, ipHash, (taken) => {
-                    if (taken) {
-                        res.writeHead(409);
-                        res.end(JSON.stringify({ error: 'Username already taken' }));
-                    } else {
-                        setUsername(ipHash, cleanUsername, () => {
-                            res.writeHead(200);
-                            res.end(JSON.stringify({ username: cleanUsername }));
-                        });
-                    }
-                });
+                const passwordHash = hashPassword(password);
+                db.run('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
+                    [username, passwordHash, Date.now()],
+                    function(err) {
+                        if (err) {
+                            if (err.message.includes('UNIQUE')) {
+                                res.writeHead(409);
+                                res.end('Username already exists');
+                            } else {
+                                res.writeHead(500);
+                                res.end();
+                            }
+                            return;
+                        }
+                        const token = generateToken();
+                        userSessions.set(token, { userId: this.lastID, username, ip });
+                        res.writeHead(200);
+                        res.end(JSON.stringify({ success: true, token, username }));
+                    });
             } catch(e) {
                 res.writeHead(400);
                 res.end();
@@ -242,10 +229,69 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    else if (req.url === '/username' && req.method === 'GET') {
-        getUsername(ipHash, (username) => {
-            res.writeHead(200);
-            res.end(JSON.stringify({ username: username || '' }));
+    else if (req.url === '/login' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const { username, password } = JSON.parse(body);
+                const passwordHash = hashPassword(password);
+                db.get('SELECT id, username FROM users WHERE username = ? AND password_hash = ?',
+                    [username, passwordHash],
+                    (err, row) => {
+                        if (err || !row) {
+                            res.writeHead(401);
+                            res.end('Invalid credentials');
+                            return;
+                        }
+                        const token = generateToken();
+                        userSessions.set(token, { userId: row.id, username: row.username, ip });
+                        res.writeHead(200);
+                        res.end(JSON.stringify({ success: true, token, username: row.username }));
+                    });
+            } catch(e) {
+                res.writeHead(400);
+                res.end();
+            }
+        });
+        return;
+    }
+    
+    else if (req.url === '/logout' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const { token } = JSON.parse(body);
+                userSessions.delete(token);
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true }));
+            } catch(e) {
+                res.writeHead(400);
+                res.end();
+            }
+        });
+        return;
+    }
+    
+    else if (req.url === '/verify' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const { token } = JSON.parse(body);
+                const session = userSessions.get(token);
+                if (session) {
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ valid: true, username: session.username }));
+                } else {
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ valid: false }));
+                }
+            } catch(e) {
+                res.writeHead(400);
+                res.end();
+            }
         });
         return;
     }
@@ -255,18 +301,24 @@ const server = http.createServer((req, res) => {
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
             try {
-                const { targetId, reason } = JSON.parse(body);
+                const { token, targetId, reason } = JSON.parse(body);
+                const session = userSessions.get(token);
+                if (!session) {
+                    res.writeHead(401);
+                    res.end('Not logged in');
+                    return;
+                }
+                
                 const reasonLower = reason.toLowerCase();
                 
-                db.get('SELECT ip_hash FROM messages WHERE id = ?', [targetId], (err, msg) => {
-                    if (err || !msg) {
+                db.get('SELECT user_id FROM messages WHERE id = ?', [targetId], (err, msg) => {
+                    if (err || !msg || !msg.user_id) {
                         res.writeHead(404);
                         res.end();
                         return;
                     }
                     
                     let isBannedFlag = false;
-                    let isUnbanned = false;
                     let isCleared = false;
                     
                     if (reasonLower === 'каша') {
@@ -276,20 +328,16 @@ const server = http.createServer((req, res) => {
                         const banKeywords = ['спамер', 'спам', 'спамит', 'spammer', 'spam', 'бот', 'flood'];
                         const shouldBan = banKeywords.some(keyword => reasonLower.includes(keyword));
                         
-                        if (reasonLower === 'аннблак') {
-                            isUnbanned = unbanByHash(msg.ip_hash);
-                        } else if (shouldBan) {
-                            const targetIp = hashToIp.get(msg.ip_hash);
-                            if (targetIp) {
-                                banIp(targetIp, 'reported as spammer');
-                                isBannedFlag = true;
-                            }
+                        if (shouldBan) {
+                            // Баним по IP (упрощённо)
+                            banIp(ip, 'reported as spammer');
+                            isBannedFlag = true;
                         }
                     }
                     
                     const timestamp = new Date().toISOString();
-                    db.run('INSERT INTO reports (target_ip_hash, reporter_ip_hash, reason, timestamp) VALUES (?, ?, ?, ?)',
-                        [msg.ip_hash, ipHash, reason, timestamp]);
+                    db.run('INSERT INTO reports (target_user_id, reporter_user_id, reason, timestamp) VALUES (?, ?, ?, ?)',
+                        [msg.user_id, session.userId, reason, timestamp]);
                     
                     if (isCleared) {
                         const currentClients = clients;
@@ -306,7 +354,6 @@ const server = http.createServer((req, res) => {
                     res.end(JSON.stringify({ 
                         success: true, 
                         banned: isBannedFlag,
-                        unbanned: isUnbanned,
                         cleared: isCleared
                     }));
                 });
@@ -322,7 +369,10 @@ const server = http.createServer((req, res) => {
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const lastId = parseInt(urlParams.searchParams.get('lastId') || '-1');
 
-        db.all('SELECT id, text, image_path, username, timestamp FROM messages WHERE id > ? ORDER BY id ASC', [lastId], (err, rows) => {
+        db.all(`SELECT m.id, m.text, m.image_path, m.username, m.timestamp, m.reply_to,
+                (SELECT text FROM messages WHERE id = m.reply_to) as reply_text,
+                (SELECT username FROM messages WHERE id = m.reply_to) as reply_username
+                FROM messages m WHERE m.id > ? ORDER BY m.id ASC`, [lastId], (err, rows) => {
             if (err) {
                 res.writeHead(500);
                 res.end();
@@ -339,39 +389,43 @@ const server = http.createServer((req, res) => {
     } 
     
     else if (req.url === '/send' && req.method === 'POST') {
-        const contentType = req.headers['content-type'] || '';
-        const isMultipart = contentType.includes('multipart/form-data');
-        
-        if (isMultipart) {
-            let body = [];
-            req.on('data', chunk => body.push(chunk));
-            req.on('end', () => {
-                const buffer = Buffer.concat(body);
-                const boundary = contentType.split('boundary=')[1];
-                if (!boundary) {
-                    res.writeHead(400);
-                    res.end();
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(body);
+                const { token, text, replyTo, isImage, imageUrl } = data;
+                
+                const session = userSessions.get(token);
+                if (!session) {
+                    res.writeHead(401);
+                    res.end('Not logged in');
                     return;
                 }
                 
-                let text = '';
-                let imageData = null;
+                let finalText = text ? text.trim() : '';
+                let finalImagePath = '';
                 
-                const parts = buffer.toString('binary').split('--' + boundary);
-                for (let part of parts) {
-                    if (part.includes('name="text"')) {
-                        const match = part.match(/\r\n\r\n(.*?)\r\n--/s);
-                        if (match) text = match[1].trim();
-                    }
-                    if (part.includes('name="image"')) {
-                        const headerEnd = part.indexOf('\r\n\r\n');
-                        if (headerEnd !== -1) {
-                            let dataStart = headerEnd + 4;
-                            let dataEnd = part.lastIndexOf('\r\n--');
-                            if (dataEnd === -1) dataEnd = part.length;
-                            imageData = part.slice(dataStart, dataEnd);
-                        }
-                    }
+                if (isImage && imageUrl) {
+                    // Для base64 фото (упрощённо)
+                    const base64Data = imageUrl.replace(/^data:image\/\w+;base64,/, '');
+                    const filename = Date.now() + '_' + Math.random().toString(36).substr(2, 8) + '.jpg';
+                    finalImagePath = '/uploads/' + filename;
+                    const fullPath = path.join(uploadDir, filename);
+                    fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
+                    finalText = '';
+                }
+                
+                if ((!finalText && !finalImagePath) || finalText.length > 100) {
+                    res.writeHead(400);
+                    res.end('Invalid message');
+                    return;
+                }
+                
+                if (finalText.length > 0 && (/(.)\1{15,}/.test(finalText))) {
+                    res.writeHead(400);
+                    res.end('No spam patterns');
+                    return;
                 }
                 
                 const now = Date.now();
@@ -390,41 +444,54 @@ const server = http.createServer((req, res) => {
                     return;
                 }
                 
-                let imagePath = '';
-                if (imageData) {
-                    const filename = Date.now() + '_' + Math.random().toString(36).substr(2, 8) + '.jpg';
-                    imagePath = '/uploads/' + filename;
-                    const fullPath = path.join(uploadDir, filename);
-                    fs.writeFileSync(fullPath, imageData, 'binary');
+                if (finalText.length > 0) {
+                    checkSpamRules(ip, finalText, (banned, reason) => {
+                        if (banned) {
+                            res.writeHead(403);
+                            res.end(reason);
+                            return;
+                        }
+                        proceedToSave();
+                    });
+                } else {
+                    proceedToSave();
                 }
                 
-                if (text.length > 0 && (/(.)\1{15,}/.test(text))) {
-                    res.writeHead(400);
-                    res.end('No spam patterns');
-                    return;
-                }
-                
-                checkSpamRules(ip, text, (banned, reason) => {
-                    if (banned) {
-                        res.writeHead(403);
-                        res.end(reason);
-                        return;
-                    }
-                    
+                function proceedToSave() {
                     cooldowns.set(ip, now);
                     daily.count++;
                     dailyCounts.set(ip, daily);
                     
                     const timestamp = new Date().toLocaleTimeString();
+                    const replyId = replyTo ? parseInt(replyTo) : 0;
                     
-                    getUsername(ipHash, (finalUsername) => {
-                        db.run('INSERT INTO messages (text, image_path, username, timestamp, ip_hash) VALUES (?, ?, ?, ?, ?)', 
-                            [text || '', imagePath, finalUsername || '', timestamp, ipHash], 
-                            function(err) {
-                                if (err) return;
-                                
-                                const newMsg = { id: this.lastID, text: text || '', image_path: imagePath, username: finalUsername || '', timestamp };
-                                
+                    db.run('INSERT INTO messages (text, image_path, username, reply_to, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?)', 
+                        [finalText || '', finalImagePath, session.username, replyId, timestamp, session.userId], 
+                        function(err) {
+                            if (err) return;
+                            
+                            const newMsg = { 
+                                id: this.lastID, 
+                                text: finalText || '', 
+                                image_path: finalImagePath, 
+                                username: session.username,
+                                reply_to: replyId,
+                                timestamp 
+                            };
+                            
+                            if (replyId > 0) {
+                                db.get('SELECT text, username FROM messages WHERE id = ?', [replyId], (err, replyMsg) => {
+                                    if (replyMsg) {
+                                        newMsg.reply_text = replyMsg.text;
+                                        newMsg.reply_username = replyMsg.username;
+                                    }
+                                    sendToClients(newMsg);
+                                });
+                            } else {
+                                sendToClients(newMsg);
+                            }
+                            
+                            function sendToClients(newMsg) {
                                 db.run(`DELETE FROM messages WHERE id NOT IN (
                                     SELECT id FROM messages ORDER BY id DESC LIMIT 100
                                 )`);
@@ -435,92 +502,19 @@ const server = http.createServer((req, res) => {
                                     client.res.writeHead(200, { 'Content-Type': 'application/json' });
                                     client.res.end(JSON.stringify([newMsg]));
                                 });
-                        });
+                            }
                     });
                     
                     res.writeHead(200);
                     res.end(JSON.stringify({ success: true }));
-                });
-            });
-        } else {
-            let body = '';
-            req.on('data', chunk => { body += chunk; });
-            req.on('end', () => {
-                try {
-                    const data = JSON.parse(body);
-                    let text = data.text ? data.text.trim() : '';
-                    
-                    if (text.length < 1 || text.length > 100) {
-                        res.writeHead(400);
-                        res.end('1-100 chars');
-                        return;
-                    }
-                    
-                    if (/(.)\1{15,}/.test(text)) {
-                        res.writeHead(400);
-                        res.end('No spam patterns');
-                        return;
-                    }
-                    
-                    const now = Date.now();
-                    const today = new Date().toDateString();
-                    let daily = dailyCounts.get(ip) || { count: 0, day: today };
-                    if (daily.day !== today) daily = { count: 0, day: today };
-                    if (daily.count >= 1000) {
-                        res.writeHead(429);
-                        res.end('Daily limit: 1000 messages');
-                        return;
-                    }
-                    
-                    if (cooldowns.has(ip) && now - cooldowns.get(ip) < 2000) {
-                        res.writeHead(429);
-                        res.end('Wait 2 seconds');
-                        return;
-                    }
-                    
-                    checkSpamRules(ip, text, (banned, reason) => {
-                        if (banned) {
-                            res.writeHead(403);
-                            res.end(reason);
-                            return;
-                        }
-                        
-                        cooldowns.set(ip, now);
-                        daily.count++;
-                        dailyCounts.set(ip, daily);
-                        
-                        const timestamp = new Date().toLocaleTimeString();
-                        
-                        getUsername(ipHash, (finalUsername) => {
-                            db.run('INSERT INTO messages (text, image_path, username, timestamp, ip_hash) VALUES (?, ?, ?, ?, ?)', 
-                                [text, '', finalUsername || '', timestamp, ipHash], 
-                                function(err) {
-                                    if (err) return;
-                                    
-                                    const newMsg = { id: this.lastID, text: text, image_path: '', username: finalUsername || '', timestamp };
-                                    
-                                    db.run(`DELETE FROM messages WHERE id NOT IN (
-                                        SELECT id FROM messages ORDER BY id DESC LIMIT 100
-                                    )`);
-                                    
-                                    const currentClients = clients;
-                                    clients = [];
-                                    currentClients.forEach(client => {
-                                        client.res.writeHead(200, { 'Content-Type': 'application/json' });
-                                        client.res.end(JSON.stringify([newMsg]));
-                                    });
-                            });
-                        });
-                        
-                        res.writeHead(200);
-                        res.end(JSON.stringify({ success: true }));
-                    });
-                } catch (e) {
-                    res.writeHead(400);
-                    res.end();
                 }
-            });
-        }
+                
+            } catch (e) {
+                console.error(e);
+                res.writeHead(400);
+                res.end();
+            }
+        });
     } 
     
     else if (req.url.startsWith('/uploads/') && req.method === 'GET') {
